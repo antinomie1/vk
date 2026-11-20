@@ -1,0 +1,211 @@
+// Device memory: 64 MiB blocks per memory type, carved first-fit from
+// sorted free ranges that merge on release; a request over half a block
+// gets its own allocation. Host-visible blocks stay mapped.
+
+import vk
+import ctx
+
+/// Where a buffer lives: `Gpu` is device-local; `Upload` is written by the
+/// CPU (device-local too when the whole VRAM is mappable); `Readback` is
+/// read by the CPU (cached when possible).
+pub enum Mem derive(Show) {
+    Gpu
+    Upload
+    Readback
+}
+
+struct Range {
+    off: u64
+    size: u64
+}
+
+struct Block {
+    memory: vk.DeviceMemory
+    /// Mapped address of offset 0; 0 when not host-visible.
+    addr: u64
+    free: List[Range]
+}
+
+/// Buffers and images never share a block, so `bufferImageGranularity`
+/// cannot bite.
+struct Pool {
+    type_index: u32
+    linear: bool
+    blocks: List[Block]
+}
+
+struct Alloc {
+    memory: vk.DeviceMemory
+    offset: u64
+    size: u64
+    /// Mapped address of `offset`; 0 when not host-visible.
+    addr: u64
+    /// -1 for a dedicated allocation.
+    pool: int
+    block: int
+}
+
+struct Allocator {
+    props: vk.PhysicalDeviceMemoryProperties
+    pools: List[Pool] = []
+    /// A device-local, host-visible heap larger than the 256 MiB BAR.
+    rebar: bool = false
+    block_size: u64 = 67108864
+}
+
+fn new(props: vk.PhysicalDeviceMemoryProperties) -> Allocator {
+    var rebar = false
+    let both = vk.MemoryPropertyFlags.DEVICE_LOCAL | vk.MemoryPropertyFlags.HOST_VISIBLE
+    for i in 0..int(props.memory_type_count) {
+        let t = props.memory_types[i]
+        if t.property_flags.contains(both) and props.memory_heaps[t.heap_index].size > 268435456 {
+            rebar = true
+        }
+    }
+    return Allocator { props, rebar }
+}
+
+/// The memory type for `mem` among `bits`: one with every wanted flag,
+/// else the first with the needed ones; -1 when none fits.
+fn Allocator.pick(self, bits: u32, mem: Mem) -> int {
+    let host = vk.MemoryPropertyFlags.HOST_VISIBLE | vk.MemoryPropertyFlags.HOST_COHERENT
+    let need = match mem {
+        Gpu => vk.MemoryPropertyFlags.DEVICE_LOCAL
+        Upload => host
+        Readback => host
+    }
+    let want = match mem {
+        Gpu => need
+        Upload => if self.rebar { need | vk.MemoryPropertyFlags.DEVICE_LOCAL } else { need }
+        Readback => need | vk.MemoryPropertyFlags.HOST_CACHED
+    }
+    var best = -1
+    for i in 0..int(self.props.memory_type_count) {
+        if (bits >> u32(i)) & 1 == 1 {
+            let f = self.props.memory_types[i].property_flags
+            if f.contains(want) {
+                return i
+            }
+            if best < 0 and f.contains(need) {
+                best = i
+            }
+        }
+    }
+    return best
+}
+
+fn Allocator.alloc(mut self, cx: ctx.Ctx, req: vk.MemoryRequirements, mem: Mem, linear: bool) -> Result[Alloc, str] {
+    let t = self.pick(req.memory_type_bits, mem)
+    guard t >= 0 else {
+        return Err("no memory type for {mem}")
+    }
+    let host = self.props.memory_types[t].property_flags.contains(vk.MemoryPropertyFlags.HOST_VISIBLE)
+    if req.size > self.block_size / 2 {
+        let (memory, addr) = try raw(cx, u32(t), req.size, host)
+        return Ok(Alloc { memory, offset: 0, size: req.size, addr, pool: -1, block: -1 })
+    }
+    var p = -1
+    for i, pool in self.pools {
+        if pool.type_index == u32(t) and pool.linear == linear {
+            p = i
+        }
+    }
+    if p < 0 {
+        p = self.pools.len()
+        self.pools.push(Pool { type_index: u32(t), linear, blocks: [] })
+    }
+    for b in 0..self.pools[p].blocks.len() {
+        if let Some(off) = self.pools[p].blocks[b].take(req.size, req.alignment) {
+            return Ok(self.at(p, b, off, req.size))
+        }
+    }
+    let (memory, addr) = try raw(cx, u32(t), self.block_size, host)
+    self.pools[p].blocks.push(Block { memory, addr, free: [Range { off: 0, size: self.block_size }] })
+    let b = self.pools[p].blocks.len() - 1
+    let off = self.pools[p].blocks[b].take(req.size, req.alignment).unwrap()
+    return Ok(self.at(p, b, off, req.size))
+}
+
+fn Allocator.at(self, p: int, b: int, off: u64, size: u64) -> Alloc {
+    let base = self.pools[p].blocks[b].addr
+    let addr = if base == 0 { u64(0) } else { base + off }
+    return Alloc { memory: self.pools[p].blocks[b].memory, offset: off, size, addr, pool: p, block: b }
+}
+
+fn Allocator.free(mut self, cx: ctx.Ctx, a: Alloc) {
+    if a.pool < 0 {
+        cx.fns.free_memory(cx.device, a.memory, Ptr.null())
+        return
+    }
+    self.pools[a.pool].blocks[a.block].give(a.offset, a.size)
+}
+
+/// Free every block (the device is idle).
+fn Allocator.destroy(mut self, cx: ctx.Ctx) {
+    for pool in self.pools {
+        for blk in pool.blocks {
+            cx.fns.free_memory(cx.device, blk.memory, Ptr.null())
+        }
+    }
+    self.pools.clear()
+}
+
+fn raw(cx: ctx.Ctx, t: u32, size: u64, host: bool) -> Result[(vk.DeviceMemory, u64), str] {
+    let flags = vk.MemoryAllocateFlagsInfo { flags: vk.MemoryAllocateFlags.DEVICE_ADDRESS }
+    unsafe let info = vk.MemoryAllocateInfo { p_next: Ptr.of(flags).cast[u8](), allocation_size: size, memory_type_index: t }
+    var memory = vk.DeviceMemory {}
+    unsafe let r = cx.fns.allocate_memory(cx.device, Ptr.of(info), Ptr.null(), mut memory)
+    try ctx.ok(r, "vkAllocateMemory")
+    var addr: u64 = 0
+    if host {
+        var p: Ptr[u8] = Ptr.null()
+        let rm = cx.fns.map_memory(cx.device, memory, 0, vk.whole_size, vk.MemoryMapFlags(0), mut p)
+        try ctx.ok(rm, "vkMapMemory")
+        unsafe {
+            addr = u64(p.addr())
+        }
+    }
+    return Ok((memory, addr))
+}
+
+/// The aligned offset of a `size`-byte range carved from the first free
+/// range that holds it.
+fn Block.take(mut self, size: u64, align: u64) -> Option[u64] {
+    for i in 0..self.free.len() {
+        let r = self.free[i]
+        let start = (r.off + align - 1) / align * align
+        let end = r.off + r.size
+        if start + size <= end {
+            let rest = Range { off: start + size, size: end - start - size }
+            if start > r.off {
+                self.free[i] = Range { off: r.off, size: start - r.off }
+                if rest.size > 0 {
+                    self.free.insert(i + 1, rest)
+                }
+            } else if rest.size > 0 {
+                self.free[i] = rest
+            } else {
+                discard self.free.remove(i)
+            }
+            return Some(start)
+        }
+    }
+    return None
+}
+
+/// Return `[off, off + size)`, merging it with its neighbors.
+fn Block.give(mut self, off: u64, size: u64) {
+    var i = 0
+    while i < self.free.len() and self.free[i].off < off {
+        i += 1
+    }
+    self.free.insert(i, Range { off, size })
+    if i + 1 < self.free.len() and off + size == self.free[i + 1].off {
+        self.free[i] = Range { off, size: size + self.free[i + 1].size }
+        discard self.free.remove(i + 1)
+    }
+    if i > 0 and self.free[i - 1].off + self.free[i - 1].size == off {
+        self.free[i - 1] = Range { off: self.free[i - 1].off, size: self.free[i - 1].size + self.free[i].size }
+        discard self.free.remove(i)
+    }
+}

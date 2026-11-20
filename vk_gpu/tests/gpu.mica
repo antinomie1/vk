@@ -1,0 +1,146 @@
+// Headless rendering, compute and resource retirement on the real device,
+// read back and compared pixel for pixel. Skipped without a Vulkan 1.3
+// driver; run with the validation layer when it is installed.
+
+import std.io
+import vk_gpu as gpu
+
+fn device() -> Option[gpu.Device] {
+    match gpu.Device.open(gpu.Options { headless: true, validation: true }) {
+        Ok(d) => {
+            return Some(d)
+        }
+        Err(e) => {
+            io.eprint("skipped: {e}")
+            return None
+        }
+    }
+}
+
+struct Fill derive(Bytes) {
+    addr: u64
+    count: u32
+    pad: u32
+}
+
+test "clear and read back" {
+    guard let Some(d) = device() else {
+        return
+    }
+    var dev = d
+    let tex = dev.texture(gpu.TextureDesc { width: 4, height: 3, target: true }).unwrap()
+    var e = dev.encoder().unwrap()
+    e.render(gpu.Pass { target: tex, clear: [1.0, 0.0, 0.5, 1.0] }, fn(mut r) {})
+    discard dev.submit(take e).unwrap()
+    let px = dev.read_texture(tex).unwrap()
+    assert_eq(px.len(), 48)
+    assert_eq((px[0], px[1], px[2], px[3]), (u8(255), u8(0), u8(128), u8(255)))
+    assert_eq((px[44], px[47]), (u8(255), u8(255)))
+}
+
+test "draw through an offscreen target" {
+    guard let Some(d) = device() else {
+        return
+    }
+    var dev = d
+    var out = gpu.Offscreen.create(mut dev, 8, 8, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    let p = dev.graphics(gpu.Graphics { color: gpu.Format.R8G8B8A8_UNORM }, embed("shaders/fullscreen.vert.spv"), embed("shaders/color.frag.spv")).unwrap()
+    for frame in 0..3 {
+        let f = out.acquire(mut dev).unwrap().unwrap()
+        var e = dev.encoder().unwrap()
+        let color = vec4(0.0, 1.0, f32(frame) / 2.0, 1.0)
+        e.render(gpu.Pass { target: f.image() }, fn(mut r) {
+            r.bind(p)
+            r.push(bytes_of(color))
+            r.draw(3, 1)
+        })
+        discard out.present(mut dev, f, take e).unwrap()
+    }
+    let px = dev.read_texture(out.texture()).unwrap()
+    for i in 0..64 {
+        assert_eq((px[i * 4], px[i * 4 + 1], px[i * 4 + 2], px[i * 4 + 3]), (u8(0), u8(255), u8(255), u8(255)))
+    }
+    dev.destroy_pipeline(p)
+    out.destroy(mut dev)
+}
+
+test "upload and sample by bindless index" {
+    guard let Some(d) = device() else {
+        return
+    }
+    var dev = d
+    let src = dev.texture(gpu.TextureDesc { width: 2, height: 2 }).unwrap()
+    let dst = dev.texture(gpu.TextureDesc { width: 2, height: 2, target: true }).unwrap()
+    let p = dev.graphics(gpu.Graphics { color: gpu.Format.R8G8B8A8_UNORM }, embed("shaders/fullscreen.vert.spv"), embed("shaders/sample.frag.spv")).unwrap()
+    let texels: List[u8] = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 10, 20, 30, 40]
+    var e = dev.encoder().unwrap()
+    dev.write_texture(mut e, src, texels).unwrap()
+    let index = src.index()
+    e.render(gpu.Pass { target: dst }, fn(mut r) {
+        r.bind(p)
+        r.push(bytes_of(index))
+        r.draw(3, 1)
+    })
+    discard dev.submit(take e).unwrap()
+    assert_eq(dev.read_texture(dst).unwrap(), texels)
+    // A texture nobody wrote is still sampleable (cleared to its first use).
+    let blank = dev.texture(gpu.TextureDesc { width: 2, height: 2 }).unwrap()
+    let bindex = blank.index()
+    var e2 = dev.encoder().unwrap()
+    e2.render(gpu.Pass { target: dst }, fn(mut r) {
+        r.bind(p)
+        r.push(bytes_of(bindex))
+        r.draw(3, 1)
+    })
+    dev.wait(dev.submit(take e2).unwrap()).unwrap()
+}
+
+test "compute writes through a buffer address" {
+    guard let Some(d) = device() else {
+        return
+    }
+    var dev = d
+    let n: u32 = 1000
+    let out = dev.buffer(u64(n) * 4, gpu.Mem.Readback).unwrap()
+    let p = dev.compute(embed("shaders/fill.comp.spv")).unwrap()
+    var e = dev.encoder().unwrap()
+    let args = Fill { addr: out.addr(), count: n, pad: 0 }
+    e.compute(fn(mut c) {
+        c.bind(p)
+        c.push(args.as_bytes())
+        c.dispatch((n + 63) / 64, 1, 1)
+    })
+    dev.wait(dev.submit(take e).unwrap()).unwrap()
+    let bytes = dev.read(out, 0, int(n) * 4).unwrap()
+    for i in 0..int(n) {
+        let w = int(bytes[i * 4]) | (int(bytes[i * 4 + 1]) << 8) | (int(bytes[i * 4 + 2]) << 16) | (int(bytes[i * 4 + 3]) << 24)
+        assert_eq(w, i * 3)
+    }
+}
+
+test "uploads to device-local buffers and retirement" {
+    guard let Some(d) = device() else {
+        return
+    }
+    var dev = d
+    let gpu_buf = dev.buffer(256, gpu.Mem.Gpu).unwrap()
+    let back = dev.buffer(256, gpu.Mem.Readback).unwrap()
+    var data: List[u8] = []
+    for i in 0..256 {
+        data.push(u8(i))
+    }
+    var e = dev.encoder().unwrap()
+    dev.write(mut e, gpu_buf, 0, data).unwrap()
+    discard dev.submit(take e).unwrap()
+    let t = dev.texture(gpu.TextureDesc { width: 16, height: 16 }).unwrap()
+    dev.destroy_texture(t)
+    dev.destroy_buffer(gpu_buf)
+    // Destroyed but maybe in flight: freed once the next submit completes.
+    var e2 = dev.encoder().unwrap()
+    let staged = dev.stage(data[0..16]).unwrap()
+    assert(staged.addr() != 0)
+    dev.wait(dev.submit(take e2).unwrap()).unwrap()
+    dev.destroy_buffer(back)
+    dev.wait(dev.submit(dev.encoder().unwrap()).unwrap()).unwrap()
+    assert_eq(dev.live(), 0)
+}

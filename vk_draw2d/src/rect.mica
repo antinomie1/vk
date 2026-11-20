@@ -1,0 +1,46 @@
+// Axis-aligned rectangles in pixels: shapes, clips and damage.
+
+pub struct Rect derive(Show) {
+    pub x: f32 = 0.0
+    pub y: f32 = 0.0
+    pub w: f32 = 0.0
+    pub h: f32 = 0.0
+}
+
+pub fn Rect.is_empty(self) -> bool {
+    return self.w <= 0.0 or self.h <= 0.0
+}
+
+/// The smallest rectangle holding both (an empty one adds nothing).
+pub fn Rect.union(self, o: Rect) -> Rect {
+    guard not self.is_empty() else {
+        return o
+    }
+    guard not o.is_empty() else {
+        return self
+    }
+    let x = min(self.x, o.x)
+    let y = min(self.y, o.y)
+    return Rect { x, y, w: max(self.x + self.w, o.x + o.w) - x, h: max(self.y + self.h, o.y + o.h) - y }
+}
+
+/// The overlap; empty when there is none.
+pub fn Rect.intersect(self, o: Rect) -> Rect {
+    let x = max(self.x, o.x)
+    let y = max(self.y, o.y)
+    let w = min(self.x + self.w, o.x + o.w) - x
+    let h = min(self.y + self.h, o.y + o.h) - y
+    guard w > 0.0 and h > 0.0 else {
+        return Rect {}
+    }
+    return Rect { x, y, w, h }
+}
+
+pub fn Rect.overlaps(self, o: Rect) -> bool {
+    return not self.intersect(o).is_empty()
+}
+
+/// Grown by `d` on every side.
+pub fn Rect.grow(self, d: f32) -> Rect {
+    return Rect { x: self.x - d, y: self.y - d, w: self.w + 2.0 * d, h: self.h + 2.0 * d }
+}

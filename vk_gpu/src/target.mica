@@ -1,0 +1,88 @@
+// Where frames go. A `Frame` is one image to draw into plus the binary
+// semaphores a window system needs; `present` submits the frame's encoder
+// (waiting on and signaling those semaphores, and the timeline) and shows
+// the image, so a frame cannot be presented unsynchronized.
+
+import vk
+import res
+import device
+import encoder
+
+pub struct Frame {
+    image: res.Texture
+    /// Signaled when the image may be drawn to; null when nothing to wait.
+    wait: vk.Semaphore
+    /// Signaled when drawing is done; null when nobody waits.
+    signal: vk.Semaphore
+    index: u32
+    age: u32
+}
+
+pub fn Frame.image(self) -> res.Texture {
+    return self.image
+}
+
+/// Frames since the image's contents were last presented (1: the previous
+/// frame); 0 when they are undefined. Redraw what changed in that many
+/// frames, or everything at 0.
+pub fn Frame.age(self) -> u32 {
+    return self.age
+}
+
+/// What every target provides (`Surface`, `Offscreen`).
+pub trait Target {
+    /// The next image, or `None` when there is nothing to draw to now
+    /// (a minimized window); waits for the frame that last used its slot.
+    fn acquire(mut self, mut dev: device.Device) -> Result[Option[Frame], str]
+    fn present(mut self, mut dev: device.Device, take f: Frame, take e: encoder.Encoder) -> Result[res.Ticket, str]
+    fn resize(mut self, width: u32, height: u32)
+}
+
+/// One texture as a target: tests, screenshots, headless rendering.
+pub struct Offscreen {
+    tex: res.Texture
+    last: res.Ticket
+    width: u32
+    height: u32
+    drawn: bool = false
+}
+
+pub fn Offscreen.create(mut dev: device.Device, width: u32, height: u32, format: vk.Format) -> Result[Offscreen, str] {
+    let tex = try dev.texture(res.TextureDesc { width, height, format, target: true })
+    return Ok(Offscreen { tex, last: res.Ticket {}, width, height })
+}
+
+/// The texture frames are drawn into.
+pub fn Offscreen.texture(self) -> res.Texture {
+    return self.tex
+}
+
+pub fn Offscreen.acquire(mut self, mut dev: device.Device) -> Result[Option[Frame], str] {
+    try dev.wait(self.last)
+    if self.width != self.tex.width or self.height != self.tex.height {
+        dev.destroy_texture(self.tex)
+        self.tex = try dev.texture(res.TextureDesc { width: self.width, height: self.height, format: self.tex.format, target: true })
+        self.drawn = false
+    }
+    let age: u32 = if self.drawn { 1 } else { 0 }
+    return Ok(Some(Frame { image: self.tex, wait: vk.Semaphore {}, signal: vk.Semaphore {}, index: 0, age }))
+}
+
+pub fn Offscreen.present(mut self, mut dev: device.Device, take f: Frame, take e: encoder.Encoder) -> Result[res.Ticket, str] {
+    guard f.image.h == self.tex.h and f.image.dev == self.tex.dev else {
+        dev.cancel(take e)
+        return Err("frame from another target")
+    }
+    self.last = try dev.submit(take e)
+    self.drawn = true
+    return Ok(self.last)
+}
+
+pub fn Offscreen.resize(mut self, width: u32, height: u32) {
+    self.width = width
+    self.height = height
+}
+
+pub fn Offscreen.destroy(self, mut dev: device.Device) {
+    dev.destroy_texture(self.tex)
+}

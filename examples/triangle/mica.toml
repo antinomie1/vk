@@ -1,0 +1,11 @@
+[package]
+name = "triangle"
+version = "0.1.0"
+description = "A colored triangle in an XCB window"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+vk = { path = "../../vk" }
+
+[build]
+libs = ["xcb"]

@@ -1,0 +1,151 @@
+// The one descriptor set every pipeline shares:
+//   binding 0: texture2D[slots]  (each texture at its own index)
+//   binding 1: sampler[4]      (immutable: linear/nearest x clamp/repeat)
+//   binding 2: image2D[slots]    (textures made with `storage`)
+// plus 128 bytes of push constants, so shaders get indices and buffer
+// addresses there and nothing is ever bound per draw.
+
+import vk
+import ctx
+
+struct Bindless {
+    set_layout: vk.DescriptorSetLayout
+    pool: vk.DescriptorPool
+    set: vk.DescriptorSet
+    layout: vk.PipelineLayout
+    samplers: [4]vk.Sampler
+}
+
+fn sampler(fns: vk.DeviceFnV1_0, device: vk.Device, filter: vk.Filter, address: vk.SamplerAddressMode) -> Result[vk.Sampler, str] {
+    let mip = if filter == vk.Filter.LINEAR { vk.SamplerMipmapMode.LINEAR } else { vk.SamplerMipmapMode.NEAREST }
+    let info = vk.SamplerCreateInfo {
+        mag_filter: filter,
+        min_filter: filter,
+        mipmap_mode: mip,
+        address_mode_u: address,
+        address_mode_v: address,
+        address_mode_w: address,
+        max_lod: vk.lod_clamp_none,
+    }
+    var s = vk.Sampler {}
+    unsafe let r = fns.create_sampler(device, Ptr.of(info), Ptr.null(), mut s)
+    try ctx.ok(r, "vkCreateSampler")
+    return Ok(s)
+}
+
+fn create(fns: vk.DeviceFnV1_0, device: vk.Device, slots: u32) -> Result[Bindless, str] {
+    let clamp = vk.SamplerAddressMode.CLAMP_TO_EDGE
+    let repeat = vk.SamplerAddressMode.REPEAT
+    let samplers: [4]vk.Sampler = [
+        try sampler(fns, device, vk.Filter.LINEAR, clamp),
+        try sampler(fns, device, vk.Filter.NEAREST, clamp),
+        try sampler(fns, device, vk.Filter.LINEAR, repeat),
+        try sampler(fns, device, vk.Filter.NEAREST, repeat),
+    ]
+    let stages = ctx.push_stages()
+    unsafe let bindings: [3]vk.DescriptorSetLayoutBinding = [
+        vk.DescriptorSetLayoutBinding { binding: 0, descriptor_type: vk.DescriptorType.SAMPLED_IMAGE, descriptor_count: slots, stage_flags: stages },
+        vk.DescriptorSetLayoutBinding {
+            binding: 1,
+            descriptor_type: vk.DescriptorType.SAMPLER,
+            descriptor_count: 4,
+            stage_flags: stages,
+            p_immutable_samplers: Ptr.of(samplers).cast[vk.Sampler](),
+        },
+        vk.DescriptorSetLayoutBinding { binding: 2, descriptor_type: vk.DescriptorType.STORAGE_IMAGE, descriptor_count: slots, stage_flags: stages },
+    ]
+    let dynamic = vk.DescriptorBindingFlags.UPDATE_AFTER_BIND | vk.DescriptorBindingFlags.PARTIALLY_BOUND | vk.DescriptorBindingFlags.UPDATE_UNUSED_WHILE_PENDING
+    let flags: [3]vk.DescriptorBindingFlags = [dynamic, vk.DescriptorBindingFlags(0), dynamic]
+    unsafe let flag_info = vk.DescriptorSetLayoutBindingFlagsCreateInfo { binding_count: 3, p_binding_flags: Ptr.of(flags).cast[vk.DescriptorBindingFlags]() }
+    unsafe let layout_info = vk.DescriptorSetLayoutCreateInfo {
+        p_next: Ptr.of(flag_info).cast[u8](),
+        flags: vk.DescriptorSetLayoutCreateFlags.UPDATE_AFTER_BIND_POOL,
+        binding_count: 3,
+        p_bindings: Ptr.of(bindings).cast[vk.DescriptorSetLayoutBinding](),
+    }
+    var set_layout = vk.DescriptorSetLayout {}
+    unsafe let rl = fns.create_descriptor_set_layout(device, Ptr.of(layout_info), Ptr.null(), mut set_layout)
+    try ctx.ok(rl, "vkCreateDescriptorSetLayout")
+
+    let sizes: [3]vk.DescriptorPoolSize = [
+        vk.DescriptorPoolSize { r#type: vk.DescriptorType.SAMPLED_IMAGE, descriptor_count: slots },
+        vk.DescriptorPoolSize { r#type: vk.DescriptorType.SAMPLER, descriptor_count: 4 },
+        vk.DescriptorPoolSize { r#type: vk.DescriptorType.STORAGE_IMAGE, descriptor_count: slots },
+    ]
+    unsafe let pool_info = vk.DescriptorPoolCreateInfo {
+        flags: vk.DescriptorPoolCreateFlags.UPDATE_AFTER_BIND,
+        max_sets: 1,
+        pool_size_count: 3,
+        p_pool_sizes: Ptr.of(sizes).cast[vk.DescriptorPoolSize](),
+    }
+    var pool = vk.DescriptorPool {}
+    unsafe let rp = fns.create_descriptor_pool(device, Ptr.of(pool_info), Ptr.null(), mut pool)
+    try ctx.ok(rp, "vkCreateDescriptorPool")
+    unsafe let alloc_info = vk.DescriptorSetAllocateInfo { descriptor_pool: pool, descriptor_set_count: 1, p_set_layouts: Ptr.of(set_layout) }
+    var sets: List[vk.DescriptorSet] = [vk.DescriptorSet {}]
+    unsafe let rs = fns.allocate_descriptor_sets(device, Ptr.of(alloc_info), sets)
+    try ctx.ok(rs, "vkAllocateDescriptorSets")
+
+    let range = vk.PushConstantRange { stage_flags: stages, size: ctx.push_size }
+    unsafe let pl_info = vk.PipelineLayoutCreateInfo {
+        set_layout_count: 1,
+        p_set_layouts: Ptr.of(set_layout),
+        push_constant_range_count: 1,
+        p_push_constant_ranges: Ptr.of(range),
+    }
+    var layout = vk.PipelineLayout {}
+    unsafe let rpl = fns.create_pipeline_layout(device, Ptr.of(pl_info), Ptr.null(), mut layout)
+    try ctx.ok(rpl, "vkCreatePipelineLayout")
+    return Ok(Bindless { set_layout, pool, set: sets[0], layout, samplers })
+}
+
+/// Point every slot at the placeholders: `blank` (sampled, binding 0) and
+/// `blank_storage` (binding 2), so no index ever reads an unwritten or
+/// destroyed descriptor.
+fn fill(cx: ctx.Ctx, slots: u32, blank: vk.ImageView, blank_storage: vk.ImageView) {
+    var sampled: List[vk.DescriptorImageInfo] = List.with_cap(int(slots))
+    var general: List[vk.DescriptorImageInfo] = List.with_cap(int(slots))
+    for _ in 0..slots {
+        sampled.push(vk.DescriptorImageInfo { image_view: blank, image_layout: vk.ImageLayout.SHADER_READ_ONLY_OPTIMAL })
+        general.push(vk.DescriptorImageInfo { image_view: blank_storage, image_layout: vk.ImageLayout.GENERAL })
+    }
+    unsafe let writes: [2]vk.WriteDescriptorSet = [
+        vk.WriteDescriptorSet { dst_set: cx.set, dst_binding: 0, descriptor_count: slots, descriptor_type: vk.DescriptorType.SAMPLED_IMAGE, p_image_info: sampled.as_ptr() },
+        vk.WriteDescriptorSet { dst_set: cx.set, dst_binding: 2, descriptor_count: slots, descriptor_type: vk.DescriptorType.STORAGE_IMAGE, p_image_info: general.as_ptr() },
+    ]
+    unsafe cx.fns.update_descriptor_sets(cx.device, 2, Ptr.of(writes).cast[vk.WriteDescriptorSet](), 0, Ptr.null())
+}
+
+/// Point slot `index` of binding 0 at `view`, and of binding 2 at `storage`.
+fn write(cx: ctx.Ctx, index: u32, view: vk.ImageView, storage: vk.ImageView) {
+    let sampled = vk.DescriptorImageInfo { image_view: view, image_layout: vk.ImageLayout.SHADER_READ_ONLY_OPTIMAL }
+    let general = vk.DescriptorImageInfo { image_view: storage, image_layout: vk.ImageLayout.GENERAL }
+    unsafe let writes: [2]vk.WriteDescriptorSet = [
+        vk.WriteDescriptorSet {
+            dst_set: cx.set,
+            dst_binding: 0,
+            dst_array_element: index,
+            descriptor_count: 1,
+            descriptor_type: vk.DescriptorType.SAMPLED_IMAGE,
+            p_image_info: Ptr.of(sampled),
+        },
+        vk.WriteDescriptorSet {
+            dst_set: cx.set,
+            dst_binding: 2,
+            dst_array_element: index,
+            descriptor_count: 1,
+            descriptor_type: vk.DescriptorType.STORAGE_IMAGE,
+            p_image_info: Ptr.of(general),
+        },
+    ]
+    unsafe cx.fns.update_descriptor_sets(cx.device, 2, Ptr.of(writes).cast[vk.WriteDescriptorSet](), 0, Ptr.null())
+}
+
+fn Bindless.destroy(self, fns: vk.DeviceFnV1_0, device: vk.Device) {
+    fns.destroy_pipeline_layout(device, self.layout, Ptr.null())
+    fns.destroy_descriptor_pool(device, self.pool, Ptr.null())
+    fns.destroy_descriptor_set_layout(device, self.set_layout, Ptr.null())
+    for s in self.samplers {
+        fns.destroy_sampler(device, s, Ptr.null())
+    }
+}

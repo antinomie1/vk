@@ -1,0 +1,7 @@
+[package]
+name = "generator"
+version = "0.1.0"
+description = "Generates the vk bindings from vk.xml and video.xml"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]

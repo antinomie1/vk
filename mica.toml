@@ -1,0 +1,2 @@
+[workspace]
+members = ["vk", "vk_gpu", "vk_draw2d", "vk_compose", "vk_graph", "generator", "examples/*"]

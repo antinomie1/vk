@@ -1,0 +1,115 @@
+// The render pass (one color attachment, cleared, then presented) and the
+// triangle pipeline; viewport and scissor are dynamic, so a resize keeps it.
+
+import vk
+import gpu
+
+pub struct Pipeline {
+    pass: vk.RenderPass
+    layout: vk.PipelineLayout
+    pipeline: vk.Pipeline
+}
+
+pub fn create(g: gpu.Gpu, format: vk.Format) -> Result[Pipeline, str] {
+    let pass = try render_pass(g, format)
+    let vert = try module(g, embed("../shaders/triangle.vert.spv"))
+    let frag = try module(g, embed("../shaders/triangle.frag.spv"))
+    let entry = "main"
+    unsafe let stages: [2]vk.PipelineShaderStageCreateInfo = [
+        vk.PipelineShaderStageCreateInfo { stage: vk.ShaderStageFlags.VERTEX, module: vert, p_name: entry.as_cstr() },
+        vk.PipelineShaderStageCreateInfo { stage: vk.ShaderStageFlags.FRAGMENT, module: frag, p_name: entry.as_cstr() },
+    ]
+    let vertex_input = vk.PipelineVertexInputStateCreateInfo {}
+    let assembly = vk.PipelineInputAssemblyStateCreateInfo { topology: vk.PrimitiveTopology.TRIANGLE_LIST }
+    let viewport = vk.PipelineViewportStateCreateInfo { viewport_count: 1, scissor_count: 1 }
+    let raster = vk.PipelineRasterizationStateCreateInfo {
+        polygon_mode: vk.PolygonMode.FILL,
+        cull_mode: vk.CullModeFlags.NONE,
+        front_face: vk.FrontFace.CLOCKWISE,
+        line_width: 1.0,
+    }
+    let multisample = vk.PipelineMultisampleStateCreateInfo { rasterization_samples: vk.SampleCountFlags.TYPE_1 }
+    let rgba = vk.ColorComponentFlags.R | vk.ColorComponentFlags.G | vk.ColorComponentFlags.B | vk.ColorComponentFlags.A
+    let attachment = vk.PipelineColorBlendAttachmentState { color_write_mask: rgba }
+    unsafe let blend = vk.PipelineColorBlendStateCreateInfo { attachment_count: 1, p_attachments: Ptr.of(attachment) }
+    let states: [2]vk.DynamicState = [vk.DynamicState.VIEWPORT, vk.DynamicState.SCISSOR]
+    unsafe let dynamic = vk.PipelineDynamicStateCreateInfo { dynamic_state_count: 2, p_dynamic_states: Ptr.of(states).cast[vk.DynamicState]() }
+
+    let layout_info = vk.PipelineLayoutCreateInfo {}
+    var layout = vk.PipelineLayout {}
+    unsafe let rl = g.dev.create_pipeline_layout(g.device, Ptr.of(layout_info), Ptr.null(), mut layout)
+    discard try gpu.ok(rl, "vkCreatePipelineLayout")
+
+    unsafe let info = vk.GraphicsPipelineCreateInfo {
+        stage_count: 2,
+        p_stages: Ptr.of(stages).cast[vk.PipelineShaderStageCreateInfo](),
+        p_vertex_input_state: Ptr.of(vertex_input),
+        p_input_assembly_state: Ptr.of(assembly),
+        p_viewport_state: Ptr.of(viewport),
+        p_rasterization_state: Ptr.of(raster),
+        p_multisample_state: Ptr.of(multisample),
+        p_color_blend_state: Ptr.of(blend),
+        p_dynamic_state: Ptr.of(dynamic),
+        layout,
+        render_pass: pass,
+    }
+    var pipelines: List[vk.Pipeline] = [vk.Pipeline {}]
+    unsafe let rp = g.dev.create_graphics_pipelines(g.device, vk.PipelineCache {}, 1, Ptr.of(info), Ptr.null(), pipelines)
+    g.dev.destroy_shader_module(g.device, vert, Ptr.null())
+    g.dev.destroy_shader_module(g.device, frag, Ptr.null())
+    discard try gpu.ok(rp, "vkCreateGraphicsPipelines")
+    return Ok(Pipeline { pass, layout, pipeline: pipelines[0] })
+}
+
+fn render_pass(g: gpu.Gpu, format: vk.Format) -> Result[vk.RenderPass, str] {
+    let color = vk.AttachmentDescription {
+        format,
+        samples: vk.SampleCountFlags.TYPE_1,
+        load_op: vk.AttachmentLoadOp.CLEAR,
+        store_op: vk.AttachmentStoreOp.STORE,
+        stencil_load_op: vk.AttachmentLoadOp.DONT_CARE,
+        stencil_store_op: vk.AttachmentStoreOp.DONT_CARE,
+        initial_layout: vk.ImageLayout.UNDEFINED,
+        final_layout: vk.ImageLayout.PRESENT_SRC_KHR,
+    }
+    let color_ref = vk.AttachmentReference { attachment: 0, layout: vk.ImageLayout.COLOR_ATTACHMENT_OPTIMAL }
+    unsafe let subpass = vk.SubpassDescription {
+        pipeline_bind_point: vk.PipelineBindPoint.GRAPHICS,
+        color_attachment_count: 1,
+        p_color_attachments: Ptr.of(color_ref),
+    }
+    // The acquired image is ready once the acquire semaphore waited at this stage.
+    let dep = vk.SubpassDependency {
+        src_subpass: vk.subpass_external,
+        src_stage_mask: vk.PipelineStageFlags.COLOR_ATTACHMENT_OUTPUT,
+        dst_stage_mask: vk.PipelineStageFlags.COLOR_ATTACHMENT_OUTPUT,
+        dst_access_mask: vk.AccessFlags.COLOR_ATTACHMENT_WRITE,
+    }
+    unsafe let info = vk.RenderPassCreateInfo {
+        attachment_count: 1,
+        p_attachments: Ptr.of(color),
+        subpass_count: 1,
+        p_subpasses: Ptr.of(subpass),
+        dependency_count: 1,
+        p_dependencies: Ptr.of(dep),
+    }
+    var pass = vk.RenderPass {}
+    unsafe let r = g.dev.create_render_pass(g.device, Ptr.of(info), Ptr.null(), mut pass)
+    discard try gpu.ok(r, "vkCreateRenderPass")
+    return Ok(pass)
+}
+
+/// A shader module from SPIR-V (`embed` data is 16-byte aligned).
+fn module(g: gpu.Gpu, code: str) -> Result[vk.ShaderModule, str] {
+    unsafe let info = vk.ShaderModuleCreateInfo { code_size: usize(code.len()), p_code: code.as_cstr().cast[u32]() }
+    var m = vk.ShaderModule {}
+    unsafe let r = g.dev.create_shader_module(g.device, Ptr.of(info), Ptr.null(), mut m)
+    discard try gpu.ok(r, "vkCreateShaderModule")
+    return Ok(m)
+}
+
+pub fn Pipeline.destroy(self, g: gpu.Gpu) {
+    g.dev.destroy_pipeline(g.device, self.pipeline, Ptr.null())
+    g.dev.destroy_pipeline_layout(g.device, self.layout, Ptr.null())
+    g.dev.destroy_render_pass(g.device, self.pass, Ptr.null())
+}

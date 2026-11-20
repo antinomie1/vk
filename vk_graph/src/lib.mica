@@ -1,0 +1,142 @@
+// vk_graph: a frame as passes over transient textures. Passes record in
+// the order they were added; a pass whose outputs no frame output depends
+// on is culled (passes that write no texture always run: they write
+// buffers). Transient textures come from a pool keyed by description and
+// are handed out again next frame, and freed after a few frames unused, so
+// a steady frame allocates no GPU memory. Barriers stay the encoder's job.
+
+import vk_gpu as gpu
+
+enum Body {
+    Draw(gpu.Pass, Box[fn(mut gpu.Render)])
+    Work(Box[fn(mut gpu.Compute)])
+}
+
+struct Node {
+    reads: List[u32]
+    writes: List[u32]
+    storage: List[gpu.Texture]
+    body: Body
+}
+
+struct Slot {
+    desc: gpu.TextureDesc
+    tex: gpu.Texture
+    used: bool
+    idle: int
+}
+
+/// Frames a pooled texture may sit unused before it is freed.
+let keep_frames = 3
+
+pub struct Graph {
+    pool: List[Slot] = []
+    nodes: List[Node] = []
+    ran: int = 0
+}
+
+pub fn Graph.new() -> Graph {
+    return Graph {}
+}
+
+/// A texture for this frame only: the same description gets the same
+/// texture back next frame.
+pub fn Graph.texture(mut self, mut dev: gpu.Device, d: gpu.TextureDesc) -> Result[gpu.Texture, str] {
+    for i in 0..self.pool.len() {
+        if not self.pool[i].used and self.pool[i].desc == d {
+            self.pool[i].used = true
+            self.pool[i].idle = 0
+            return Ok(self.pool[i].tex)
+        }
+    }
+    let tex = try dev.texture(d)
+    self.pool.push(Slot { desc: d, tex, used: true, idle: 0 })
+    return Ok(tex)
+}
+
+fn ids(ts: &[gpu.Texture]) -> List[u32] {
+    var out: List[u32] = []
+    for t in ts {
+        out.push(t.index())
+    }
+    return out
+}
+
+/// A pass drawing into `p.target` (and `p.depth`) that samples `reads`.
+pub fn Graph.render(mut self, p: gpu.Pass, reads: &[gpu.Texture], take body: Box[fn(mut gpu.Render)]) {
+    var writes: List[u32] = [p.target.index()]
+    if let Some(d) = p.depth {
+        writes.push(d.index())
+    }
+    self.nodes.push(Node { reads: ids(reads), writes, storage: [], body: Body.Draw(p, body) })
+}
+
+/// A compute pass that samples `reads` and imageStores `writes`.
+pub fn Graph.compute(mut self, reads: &[gpu.Texture], writes: &[gpu.Texture], take body: Box[fn(mut gpu.Compute)]) {
+    self.nodes.push(Node { reads: ids(reads), writes: ids(writes), storage: writes.to_list(), body: Body.Work(body) })
+}
+
+/// Record every pass `outputs` depend on into `e`, then start a new frame.
+pub fn Graph.run(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, outputs: &[gpu.Texture]) {
+    var needed = ids(outputs)
+    var live: List[bool] = []
+    for _ in 0..self.nodes.len() {
+        live.push(false)
+    }
+    var i = self.nodes.len() - 1
+    while i >= 0 {
+        if self.nodes[i].writes.is_empty() or self.nodes[i].writes.any(fn(w) => needed.contains(w)) {
+            live[i] = true
+            for r in self.nodes[i].reads {
+                needed.push(r)
+            }
+        }
+        i -= 1
+    }
+    self.ran = 0
+    for k in 0..self.nodes.len() {
+        guard live[k] else {
+            continue
+        }
+        self.ran += 1
+        for t in self.nodes[k].storage {
+            e.storage(t)
+        }
+        match self.nodes[k].body {
+            Draw(p, f) => e.render(p, f)
+            Work(f) => e.compute(f)
+        }
+    }
+    self.nodes.clear()
+    var k = 0
+    while k < self.pool.len() {
+        if self.pool[k].used {
+            self.pool[k].used = false
+            k += 1
+        } else if self.pool[k].idle >= keep_frames {
+            dev.destroy_texture(self.pool[k].tex)
+            discard self.pool.remove(k)
+        } else {
+            self.pool[k].idle += 1
+            k += 1
+        }
+    }
+}
+
+/// Passes recorded by the last `run`.
+pub fn Graph.ran(self) -> int {
+    return self.ran
+}
+
+/// Pooled textures (for tests and stats).
+pub fn Graph.pooled(self) -> int {
+    return self.pool.len()
+}
+
+pub fn Graph.destroy(mut self, mut dev: gpu.Device) {
+    for s in self.pool {
+        dev.destroy_texture(s.tex)
+    }
+    self.pool.clear()
+    self.nodes.clear()
+}

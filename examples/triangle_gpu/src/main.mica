@@ -1,0 +1,49 @@
+// triangle_gpu [frames]: the triangle example on vk_gpu. A device, a
+// surface and one pipeline; the frame loop is acquire, record, present.
+// Swapchain rebuilds, semaphores, layouts and barriers happen inside.
+
+import std.io
+import std.env
+import std.time
+import vk_gpu as gpu
+import xcb
+
+fn main() -> int {
+    let args = env.args()
+    let frames = if args.len() > 1 { args[1].to_int().unwrap_or(0) } else { 0 }
+    match run(frames) {
+        Ok(n) => {
+            io.print("{n} frames")
+            return 0
+        }
+        Err(e) => {
+            io.eprint("triangle_gpu: {e}")
+            return 1
+        }
+    }
+}
+
+fn run(frames: int) -> Result[int, str] {
+    var win = try xcb.open("vk_gpu triangle", 800, 600)
+    var dev = try gpu.Device.open(gpu.Options { app_name: "triangle_gpu" })
+    unsafe let native = gpu.Native.xcb(win.connection(), win.id)
+    var out = try gpu.Surface.create(mut dev, native, win.width, win.height, true)
+    let tri = try dev.graphics(gpu.Graphics { color: out.format() }, embed("../shaders/triangle.vert.spv"), embed("../shaders/triangle.frag.spv"))
+
+    var drawn = 0
+    while win.poll() and (frames == 0 or drawn < frames) {
+        guard let Some(f) = try out.acquire(mut dev) else {
+            time.sleep_ms(16)
+            continue
+        }
+        var e = try dev.encoder()
+        e.render(gpu.Pass { target: f.image(), clear: [0.02, 0.02, 0.03, 1.0] }, fn(mut r) {
+            r.bind(tri)
+            r.draw(3, 1)
+        })
+        discard try out.present(mut dev, f, take e)
+        drawn += 1
+    }
+    out.destroy(mut dev)
+    return Ok(drawn)
+}

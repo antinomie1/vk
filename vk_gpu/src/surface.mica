@@ -1,0 +1,315 @@
+// A window's swapchain as a target. FIFO (vsync) unless asked otherwise.
+// The swapchain is rebuilt before the next acquire when the window reports
+// a new size (`resize`; Wayland never says "out of date"), when acquire or
+// present says it is out of date, or after a suboptimal frame was still
+// drawn and presented (its acquire semaphore was already signaled).
+
+import vk
+import ctx
+import res
+import sync
+import device
+import encoder
+import target
+
+/// A native window to create a surface for.
+pub unsafe struct Native {
+    wayland: bool
+    display: Ptr[u8]
+    xcb_window: u32
+    wl_surface: Ptr[u8]
+}
+
+/// An XCB (X11 or XWayland) window.
+pub unsafe fn Native.xcb(connection: Ptr[u8], window: u32) -> Native {
+    return Native { wayland: false, display: connection, xcb_window: window, wl_surface: Ptr.null() }
+}
+
+/// A Wayland `wl_surface` on `display`.
+pub unsafe fn Native.wayland(display: Ptr[u8], surface: Ptr[u8]) -> Native {
+    return Native { wayland: true, display, xcb_window: 0, wl_surface: surface }
+}
+
+/// Frames that may be in flight at once.
+let slots = 2
+
+pub struct Surface {
+    dev: u64
+    surf: vk.KhrSurfaceInstanceFn
+    sc: vk.KhrSwapchainDeviceFn
+    surface: vk.SurfaceKHR
+    swapchain: vk.SwapchainKHR = vk.SwapchainKHR {}
+    format: vk.SurfaceFormatKHR
+    vsync: bool
+    /// The size asked for; the surface may dictate another.
+    width: u32
+    height: u32
+    extent: vk.Extent2D = vk.Extent2D {}
+    images: List[res.Texture] = []
+    /// One per image: signaled by the submit that drew it, waited by its present.
+    rendered: List[vk.Semaphore] = []
+    /// One per slot: signaled by acquire, waited by the slot's submit.
+    acquired: List[vk.Semaphore] = []
+    tickets: List[res.Ticket] = []
+    /// Acquires so far, and per image the acquire that last presented it (0: never).
+    count: u64 = 0
+    shown: List[u64] = []
+    slot: int = 0
+    dirty: bool = true
+}
+
+pub fn Surface.create(mut dev: device.Device, w: Native, width: u32, height: u32, vsync: bool) -> Result[Surface, str] {
+    let cx = dev.cx
+    guard let Some(surf) = dev.wsi.surf else {
+        return Err("VK_KHR_surface is missing (or the device was opened headless)")
+    }
+    guard let Some(sc) = dev.wsi.swapchain else {
+        return Err("VK_KHR_swapchain is missing")
+    }
+    var surface = vk.SurfaceKHR {}
+    if w.wayland {
+        guard let Some(wl) = dev.wsi.wayland else {
+            return Err("VK_KHR_wayland_surface is missing")
+        }
+        let info = vk.WaylandSurfaceCreateInfoKHR { display: w.display, surface: w.wl_surface }
+        unsafe try ctx.ok(wl.create_wayland_surface_khr(cx.instance, Ptr.of(info), Ptr.null(), mut surface), "vkCreateWaylandSurfaceKHR")
+    } else {
+        guard let Some(xcb) = dev.wsi.xcb else {
+            return Err("VK_KHR_xcb_surface is missing")
+        }
+        let info = vk.XcbSurfaceCreateInfoKHR { connection: w.display, window: w.xcb_window }
+        unsafe try ctx.ok(xcb.create_xcb_surface_khr(cx.instance, Ptr.of(info), Ptr.null(), mut surface), "vkCreateXcbSurfaceKHR")
+    }
+    var present: vk.Bool32 = 0
+    discard surf.get_physical_device_surface_support_khr(cx.pdev, cx.family, surface, mut present)
+    guard present == vk.r#true else {
+        surf.destroy_surface_khr(cx.instance, surface, Ptr.null())
+        return Err("the device's queue cannot present to this window")
+    }
+    var s = Surface { dev: dev.id, surf, sc, surface, format: try pick_format(cx, surf, surface), vsync, width, height }
+    for _ in 0..slots {
+        s.acquired.push(try semaphore(cx))
+        s.tickets.push(res.Ticket {})
+    }
+    return Ok(s)
+}
+
+fn semaphore(cx: ctx.Ctx) -> Result[vk.Semaphore, str] {
+    let info = vk.SemaphoreCreateInfo {}
+    var sem = vk.Semaphore {}
+    unsafe try ctx.ok(cx.fns.create_semaphore(cx.device, Ptr.of(info), Ptr.null(), mut sem), "vkCreateSemaphore")
+    return Ok(sem)
+}
+
+/// B8G8R8A8 or R8G8B8A8 sRGB when offered, else the first format.
+fn pick_format(cx: ctx.Ctx, surf: vk.KhrSurfaceInstanceFn, surface: vk.SurfaceKHR) -> Result[vk.SurfaceFormatKHR, str] {
+    var n: u32 = 0
+    try ctx.ok(surf.get_physical_device_surface_formats_khr(cx.pdev, surface, mut n, Ptr.null()), "vkGetPhysicalDeviceSurfaceFormatsKHR")
+    var formats: List[vk.SurfaceFormatKHR] = []
+    for _ in 0..n {
+        formats.push(vk.SurfaceFormatKHR {})
+    }
+    try ctx.ok(surf.get_physical_device_surface_formats_khr(cx.pdev, surface, mut n, formats), "vkGetPhysicalDeviceSurfaceFormatsKHR")
+    guard not formats.is_empty() else {
+        return Err("the surface has no formats")
+    }
+    for f in formats {
+        if (f.format == vk.Format.B8G8R8A8_SRGB or f.format == vk.Format.R8G8B8A8_SRGB) and f.color_space == vk.ColorSpaceKHR.SRGB_NONLINEAR {
+            return Ok(f)
+        }
+    }
+    return Ok(formats[0])
+}
+
+/// The format frames are drawn in (for pipelines).
+pub fn Surface.format(self) -> vk.Format {
+    return self.format.format
+}
+
+pub fn Surface.resize(mut self, width: u32, height: u32) {
+    if width != self.width or height != self.height {
+        self.width = width
+        self.height = height
+        self.dirty = true
+    }
+}
+
+/// Rebuild the swapchain; false while the window has no area.
+fn Surface.build(mut self, mut dev: device.Device) -> Result[bool, str] {
+    let cx = dev.cx
+    var caps = vk.SurfaceCapabilitiesKHR {}
+    try ctx.ok(self.surf.get_physical_device_surface_capabilities_khr(cx.pdev, self.surface, mut caps), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+    var extent = caps.current_extent
+    if extent.width == 0xFFFFFFFF {
+        extent = vk.Extent2D {
+            width: max(caps.min_image_extent.width, min(self.width, caps.max_image_extent.width)),
+            height: max(caps.min_image_extent.height, min(self.height, caps.max_image_extent.height)),
+        }
+    }
+    guard extent.width > 0 and extent.height > 0 else {
+        return Ok(false)
+    }
+    try dev.drain()
+    var count = caps.min_image_count + 1
+    if caps.max_image_count > 0 and count > caps.max_image_count {
+        count = caps.max_image_count
+    }
+    var alpha = vk.CompositeAlphaFlagsKHR.OPAQUE
+    for a in [vk.CompositeAlphaFlagsKHR.OPAQUE, vk.CompositeAlphaFlagsKHR.INHERIT, vk.CompositeAlphaFlagsKHR.PRE_MULTIPLIED, vk.CompositeAlphaFlagsKHR.POST_MULTIPLIED] {
+        if caps.supported_composite_alpha.contains(a) {
+            alpha = a
+            break
+        }
+    }
+    let info = vk.SwapchainCreateInfoKHR {
+        surface: self.surface,
+        min_image_count: count,
+        image_format: self.format.format,
+        image_color_space: self.format.color_space,
+        image_extent: extent,
+        image_array_layers: 1,
+        image_usage: vk.ImageUsageFlags.COLOR_ATTACHMENT | vk.ImageUsageFlags.TRANSFER_DST,
+        image_sharing_mode: vk.SharingMode.EXCLUSIVE,
+        pre_transform: caps.current_transform,
+        composite_alpha: alpha,
+        present_mode: try self.present_mode(cx),
+        clipped: vk.r#true,
+        old_swapchain: self.swapchain,
+    }
+    var handle = vk.SwapchainKHR {}
+    unsafe try ctx.ok(self.sc.create_swapchain_khr(cx.device, Ptr.of(info), Ptr.null(), mut handle), "vkCreateSwapchainKHR")
+    self.release(mut dev)
+    self.swapchain = handle
+    self.extent = extent
+
+    var n: u32 = 0
+    try ctx.ok(self.sc.get_swapchain_images_khr(cx.device, handle, mut n, Ptr.null()), "vkGetSwapchainImagesKHR")
+    var raw: List[vk.Image] = []
+    for _ in 0..n {
+        raw.push(vk.Image {})
+    }
+    try ctx.ok(self.sc.get_swapchain_images_khr(cx.device, handle, mut n, raw), "vkGetSwapchainImagesKHR")
+    for image in raw {
+        self.images.push(try dev.adopt(image, self.format.format, extent.width, extent.height))
+        self.rendered.push(try semaphore(cx))
+        self.shown.push(0)
+    }
+    self.dirty = false
+    return Ok(true)
+}
+
+fn Surface.present_mode(self, cx: ctx.Ctx) -> Result[vk.PresentModeKHR, str] {
+    guard not self.vsync else {
+        return Ok(vk.PresentModeKHR.FIFO)
+    }
+    var n: u32 = 0
+    try ctx.ok(self.surf.get_physical_device_surface_present_modes_khr(cx.pdev, self.surface, mut n, Ptr.null()), "vkGetPhysicalDeviceSurfacePresentModesKHR")
+    var modes: List[vk.PresentModeKHR] = []
+    for _ in 0..n {
+        modes.push(vk.PresentModeKHR.FIFO)
+    }
+    try ctx.ok(self.surf.get_physical_device_surface_present_modes_khr(cx.pdev, self.surface, mut n, modes), "vkGetPhysicalDeviceSurfacePresentModesKHR")
+    for m in [vk.PresentModeKHR.MAILBOX, vk.PresentModeKHR.IMMEDIATE] {
+        if modes.contains(m) {
+            return Ok(m)
+        }
+    }
+    return Ok(vk.PresentModeKHR.FIFO)
+}
+
+/// Drop the images and per-image semaphores of the current swapchain and
+/// the swapchain itself (the device is idle).
+fn Surface.release(mut self, mut dev: device.Device) {
+    let cx = dev.cx
+    for t in self.images {
+        dev.unadopt(t)
+    }
+    for s in self.rendered {
+        cx.fns.destroy_semaphore(cx.device, s, Ptr.null())
+    }
+    self.images.clear()
+    self.rendered.clear()
+    self.shown.clear()
+    if self.swapchain.raw != 0 {
+        self.sc.destroy_swapchain_khr(cx.device, self.swapchain, Ptr.null())
+        self.swapchain = vk.SwapchainKHR {}
+    }
+}
+
+pub fn Surface.acquire(mut self, mut dev: device.Device) -> Result[Option[target.Frame], str] {
+    guard dev.id == self.dev else {
+        return Err("surface belongs to another device")
+    }
+    for _ in 0..2 {
+        if self.dirty {
+            guard try self.build(mut dev) else {
+                return Ok(None)
+            }
+        }
+        let slot = (self.slot + 1) % slots
+        try dev.wait(self.tickets[slot])
+        var index: u32 = 0
+        let r = self.sc.acquire_next_image_khr(dev.cx.device, self.swapchain, ~u64(0), self.acquired[slot], vk.Fence {}, mut index)
+        if r == vk.VkResult.ERROR_OUT_OF_DATE_KHR {
+            // Nothing was signaled: rebuild and try once more.
+            self.dirty = true
+            continue
+        }
+        if r == vk.VkResult.SUBOPTIMAL_KHR {
+            // Signaled: draw and present this one, rebuild before the next.
+            self.dirty = true
+        } else {
+            try ctx.ok(r, "vkAcquireNextImageKHR")
+        }
+        self.slot = slot
+        self.count += 1
+        let shown = self.shown[index]
+        let age: u32 = if shown == 0 { 0 } else { u32(self.count - shown) }
+        return Ok(Some(target.Frame { image: self.images[index], wait: self.acquired[slot], signal: self.rendered[index], index, age }))
+    }
+    return Ok(None)
+}
+
+pub fn Surface.present(mut self, mut dev: device.Device, take f: target.Frame, take e: encoder.Encoder) -> Result[res.Ticket, str] {
+    var e = e
+    guard dev.id == self.dev and f.index < u32(self.images.len()) and self.images[f.index].h == f.image.h else {
+        dev.cancel(take e)
+        return Err("frame from another surface or device")
+    }
+    e.push_cmd(encoder.Cmd.Present(f.image))
+    let t = try dev.submit_sync(take e, f.wait, f.signal)
+    self.tickets[self.slot] = t
+    self.shown[f.index] = self.count
+    let signal = f.signal
+    let swapchain = self.swapchain
+    let index = f.index
+    unsafe let info = vk.PresentInfoKHR {
+        wait_semaphore_count: 1,
+        p_wait_semaphores: Ptr.of(signal),
+        swapchain_count: 1,
+        p_swapchains: Ptr.of(swapchain),
+        p_image_indices: Ptr.of(index),
+    }
+    unsafe let r = self.sc.queue_present_khr(dev.cx.queue, Ptr.of(info))
+    if r == vk.VkResult.ERROR_OUT_OF_DATE_KHR or r == vk.VkResult.SUBOPTIMAL_KHR {
+        self.dirty = true
+    } else {
+        try ctx.ok(r, "vkQueuePresentKHR")
+    }
+    return Ok(t)
+}
+
+/// Destroy the swapchain and surface (before the device).
+pub fn Surface.destroy(mut self, mut dev: device.Device) {
+    guard dev.id == self.dev else {
+        return
+    }
+    discard dev.drain()
+    self.release(mut dev)
+    let cx = dev.cx
+    for s in self.acquired {
+        cx.fns.destroy_semaphore(cx.device, s, Ptr.null())
+    }
+    self.acquired.clear()
+    self.surf.destroy_surface_khr(cx.instance, self.surface, Ptr.null())
+}

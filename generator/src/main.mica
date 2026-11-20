@@ -1,0 +1,46 @@
+// generator <registry dir> <vk dir>: reads vk.xml and video.xml from the
+// registry directory (`/usr/share/vulkan/registry`, or Vulkan-Headers'
+// `registry/`) and writes the vk package's `src/lib.mica` and its layout
+// test `tests/layout.mica` + `tests/layout.c`.
+
+import std.io
+import std.env
+import std.fs
+import xml
+import registry
+import emit
+import layout
+
+fn main() -> int {
+    let args = env.args()
+    guard args.len() == 3 else {
+        io.eprint("usage: generator <registry dir> <vk dir>")
+        return 2
+    }
+    match run(args[1], args[2]) {
+        Ok(n) => {
+            io.print("wrote {args[2]}/src/lib.mica ({n} bytes) and tests/layout.*")
+            return 0
+        }
+        Err(e) => {
+            io.eprint("generator: {e}")
+            return 1
+        }
+    }
+}
+
+fn run(dir: str, out: str) -> Result[int, str] {
+    var r = registry.new()
+    for file in ["vk.xml", "video.xml"] {
+        let path = dir + "/" + file
+        let src = try fs.read_to_str(path)
+        let doc = try xml.parse(src).map_err(fn(e) => "{path}: {e}")
+        discard try registry.load(mut r, doc)
+    }
+    let text = try emit.emit(r)
+    discard try fs.write(out + "/src/lib.mica", text)
+    let (c, m) = layout.emit(r)
+    discard try fs.write(out + "/tests/layout.c", c)
+    discard try fs.write(out + "/tests/layout.mica", m)
+    return Ok(text.len())
+}

@@ -1,0 +1,101 @@
+// A scene composited into a 32x32 offscreen target on the real device:
+// moves redraw only their damage, idle frames draw nothing, and a window
+// backed by an imported dmabuf is acquired, sampled and released.
+
+import vk_gpu as gpu
+import vk_draw2d as draw2d
+import vk_compose as compose
+
+fn solid(mut dev: gpu.Device, w: u32, h: u32, rgba: [4]u8) -> gpu.Texture {
+    let t = dev.texture(gpu.TextureDesc { width: w, height: h }).unwrap()
+    var data: List[u8] = []
+    for _ in 0..int(w * h) {
+        for b in rgba {
+            data.push(b)
+        }
+    }
+    var e = dev.encoder().unwrap()
+    dev.write_texture(mut e, t, data).unwrap()
+    discard dev.submit(take e).unwrap()
+    return t
+}
+
+/// Composite one frame; whether anything was drawn, and the pixels.
+fn frame(mut dev: gpu.Device, mut c: draw2d.Canvas, mut s: compose.Scene, mut out: gpu.Offscreen) -> (bool, List[u8]) {
+    let f = out.acquire(mut dev).unwrap().unwrap()
+    var e = dev.encoder().unwrap()
+    let drew = s.render(mut dev, mut c, mut e, f).unwrap()
+    discard out.present(mut dev, f, take e).unwrap()
+    return (drew, dev.read_texture(out.texture()).unwrap())
+}
+
+fn px(img: List[u8], x: int, y: int) -> (u8, u8, u8, u8) {
+    let i = (y * 32 + x) * 4
+    return (img[i], img[i + 1], img[i + 2], img[i + 3])
+}
+
+let black = (u8(0), u8(0), u8(0), u8(255))
+let red = (u8(255), u8(0), u8(0), u8(255))
+
+test "damage follows moves and idle frames draw nothing" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return
+    }
+    var dev = d
+    var out = gpu.Offscreen.create(mut dev, 32, 32, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    var c = draw2d.Canvas.create(mut dev, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    var s = compose.Scene.new(32, 32, vec4(0.0, 0.0, 0.0, 1.0))
+    let id = s.add(compose.View { tex: solid(mut dev, 8, 8, [255, 0, 0, 255]) })
+
+    let (drew, img) = frame(mut dev, mut c, mut s, mut out)
+    assert(drew)
+    assert_eq(px(img, 2, 2), red)
+    assert_eq(px(img, 20, 20), black)
+    assert(s.idle())
+    let (again, _) = frame(mut dev, mut c, mut s, mut out)
+    assert(not again)
+
+    var v = s.get(id).unwrap()
+    v.x = 16.0
+    v.y = 16.0
+    s.set(id, v)
+    assert(not s.idle())
+    let (moved, img2) = frame(mut dev, mut c, mut s, mut out)
+    assert(moved)
+    assert_eq(px(img2, 2, 2), black)
+    assert_eq(px(img2, 18, 18), red)
+
+    // A blue window on top, half transparent, then raised and removed.
+    let top = s.add(compose.View { tex: solid(mut dev, 32, 32, [0, 0, 255, 255]), opacity: 0.5 })
+    let (_, img3) = frame(mut dev, mut c, mut s, mut out)
+    let (r, g, b, a) = px(img3, 18, 18)
+    assert(r > 120 and r < 135 and b > 120 and b < 135)
+    s.remove(top)
+    let (_, img4) = frame(mut dev, mut c, mut s, mut out)
+    assert_eq(px(img4, 18, 18), red)
+    assert_eq(px(img4, 2, 2), black)
+}
+
+test "an imported dmabuf window" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return
+    }
+    var dev = d
+    // Stand-in client: renders green into a buffer it shares as a dmabuf.
+    guard let Ok((client, buf)) = dev.export_dmabuf(gpu.TextureDesc { width: 8, height: 8 }) else {
+        return
+    }
+    var e = dev.encoder().unwrap()
+    e.render(gpu.Pass { target: client, clear: [0.0, 1.0, 0.0, 1.0] }, fn(mut r) {})
+    let (_, fence) = dev.submit_sync_file(take e).unwrap()
+
+    let tex = dev.import_dmabuf(buf).unwrap()
+    dev.wait_sync_file(fence).unwrap()
+    var out = gpu.Offscreen.create(mut dev, 32, 32, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    var c = draw2d.Canvas.create(mut dev, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    var s = compose.Scene.new(32, 32, vec4(0.0, 0.0, 0.0, 1.0))
+    discard s.add(compose.View { tex, x: 4.0, y: 4.0, w: 16.0, h: 16.0, radius: 4.0, shadow: 4.0 })
+    let (_, img) = frame(mut dev, mut c, mut s, mut out)
+    assert_eq(px(img, 12, 12), (u8(0), u8(255), u8(0), u8(255)))
+    assert_eq(px(img, 30, 30), black)
+}

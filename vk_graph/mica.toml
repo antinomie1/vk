@@ -1,0 +1,8 @@
+[package]
+name = "vk_graph"
+version = "0.1.0"
+description = "Render graph on vk_gpu: pass culling and pooled transient textures"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+vk_gpu = { path = "../vk_gpu" }

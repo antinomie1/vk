@@ -1,0 +1,45 @@
+// vk_gpu: Vulkan 1.3 behind a few nouns. `Device` owns everything;
+// `Buffer`, `Texture` and `Pipeline` are Copy handles; an `Encoder` records
+// and inserts barriers itself; a target (`Surface`, `Offscreen`) hands out
+// `Frame`s and presents them; every submit returns a `Ticket`.
+// `vk_gpu/shaders/vk_gpu.glsl` declares the bindless layout for shaders.
+
+import vk
+pub import device
+pub import res
+pub import alloc
+pub import encoder
+pub import pipeline
+pub import target
+pub import surface
+pub import external
+
+pub type Device = device.Device
+pub type Options = device.Options
+pub type Texture = res.Texture
+pub type TextureDesc = res.TextureDesc
+pub type Buffer = res.Buffer
+pub type Pipeline = res.Pipeline
+pub type Ticket = res.Ticket
+pub type Staged = res.Staged
+pub type Mem = alloc.Mem
+pub type Encoder = encoder.Encoder
+pub type Pass = encoder.Pass
+pub type Load = encoder.Load
+pub type Render = encoder.Render
+pub type Compute = encoder.Compute
+pub type Graphics = pipeline.Graphics
+pub type Blend = pipeline.Blend
+pub type Cull = pipeline.Cull
+pub type Frame = target.Frame
+pub type Offscreen = target.Offscreen
+pub type Surface = surface.Surface
+pub type Native = surface.Native
+pub type Format = vk.Format
+pub type Dmabuf = external.Dmabuf
+
+/// Sampler indices in binding 1.
+pub let linear_clamp: u32 = 0
+pub let nearest_clamp: u32 = 1
+pub let linear_repeat: u32 = 2
+pub let nearest_repeat: u32 = 3

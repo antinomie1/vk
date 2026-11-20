@@ -1,0 +1,61 @@
+// The raw device: handles and command tables every module needs, in one
+// Copy value so helpers borrow it instead of the whole `Device`.
+
+import vk
+
+/// The commands an `Encoder` records, resolved once per device.
+extern table Cmds {
+    fn begin(command_buffer: vk.CommandBuffer, p_begin_info: Ptr[vk.CommandBufferBeginInfo]) -> vk.VkResult = "vkBeginCommandBuffer"
+    fn end(command_buffer: vk.CommandBuffer) -> vk.VkResult = "vkEndCommandBuffer"
+    fn barrier(command_buffer: vk.CommandBuffer, p_dependency_info: Ptr[vk.DependencyInfo]) = "vkCmdPipelineBarrier2"
+    fn begin_rendering(command_buffer: vk.CommandBuffer, p_rendering_info: Ptr[vk.RenderingInfo]) = "vkCmdBeginRendering"
+    fn end_rendering(command_buffer: vk.CommandBuffer) = "vkCmdEndRendering"
+    fn bind_pipeline(command_buffer: vk.CommandBuffer, bind_point: vk.PipelineBindPoint, pipeline: vk.Pipeline) = "vkCmdBindPipeline"
+    fn bind_sets(command_buffer: vk.CommandBuffer, bind_point: vk.PipelineBindPoint, layout: vk.PipelineLayout, first_set: u32, count: u32, p_sets: Ptr[vk.DescriptorSet], dynamic_count: u32, p_dynamic: Ptr[u32]) = "vkCmdBindDescriptorSets"
+    fn push_constants(command_buffer: vk.CommandBuffer, layout: vk.PipelineLayout, stages: vk.ShaderStageFlags, offset: u32, size: u32, p_values: Ptr[u8]) = "vkCmdPushConstants"
+    fn set_viewport(command_buffer: vk.CommandBuffer, first: u32, count: u32, p_viewports: Ptr[vk.Viewport]) = "vkCmdSetViewport"
+    fn set_scissor(command_buffer: vk.CommandBuffer, first: u32, count: u32, p_scissors: Ptr[vk.Rect2D]) = "vkCmdSetScissor"
+    fn bind_index_buffer(command_buffer: vk.CommandBuffer, buffer: vk.Buffer, offset: u64, index_type: vk.IndexType) = "vkCmdBindIndexBuffer"
+    fn draw(command_buffer: vk.CommandBuffer, vertex_count: u32, instance_count: u32, first_vertex: u32, first_instance: u32) = "vkCmdDraw"
+    fn draw_indexed(command_buffer: vk.CommandBuffer, index_count: u32, instance_count: u32, first_index: u32, vertex_offset: i32, first_instance: u32) = "vkCmdDrawIndexed"
+    fn draw_indirect(command_buffer: vk.CommandBuffer, buffer: vk.Buffer, offset: u64, draw_count: u32, stride: u32) = "vkCmdDrawIndirect"
+    fn dispatch(command_buffer: vk.CommandBuffer, x: u32, y: u32, z: u32) = "vkCmdDispatch"
+    fn dispatch_indirect(command_buffer: vk.CommandBuffer, buffer: vk.Buffer, offset: u64) = "vkCmdDispatchIndirect"
+    fn copy_buffer(command_buffer: vk.CommandBuffer, src: vk.Buffer, dst: vk.Buffer, count: u32, p_regions: Ptr[vk.BufferCopy]) = "vkCmdCopyBuffer"
+    fn copy_buffer_to_image(command_buffer: vk.CommandBuffer, src: vk.Buffer, dst: vk.Image, layout: vk.ImageLayout, count: u32, p_regions: Ptr[vk.BufferImageCopy]) = "vkCmdCopyBufferToImage"
+    fn clear_color_image(command_buffer: vk.CommandBuffer, image: vk.Image, layout: vk.ImageLayout, p_color: Ptr[vk.ClearColorValue], count: u32, p_ranges: Ptr[vk.ImageSubresourceRange]) = "vkCmdClearColorImage"
+    fn copy_image_to_buffer(command_buffer: vk.CommandBuffer, src: vk.Image, layout: vk.ImageLayout, dst: vk.Buffer, count: u32, p_regions: Ptr[vk.BufferImageCopy]) = "vkCmdCopyImageToBuffer"
+}
+
+struct Ctx {
+    inst: vk.InstanceFnV1_0
+    fns: vk.DeviceFnV1_0
+    v12: vk.DeviceFnV1_2
+    v13: vk.DeviceFnV1_3
+    cmd: Cmds
+    instance: vk.Instance
+    pdev: vk.PhysicalDevice
+    device: vk.Device
+    queue: vk.Queue
+    family: u32
+    /// Queue family of imported resources' producers (FOREIGN when available).
+    foreign: u32
+    /// The one pipeline layout: the bindless set and 128 bytes of push constants.
+    layout: vk.PipelineLayout
+    set: vk.DescriptorSet
+}
+
+/// Push constant bytes every pipeline gets (the guaranteed minimum).
+let push_size: u32 = 128
+
+fn push_stages() -> vk.ShaderStageFlags {
+    return vk.ShaderStageFlags.ALL_GRAPHICS | vk.ShaderStageFlags.COMPUTE
+}
+
+/// `Err` naming the call unless `r` is `SUCCESS`.
+fn ok(r: vk.VkResult, what: str) -> Result[(), str] {
+    guard r == vk.VkResult.SUCCESS else {
+        return Err("{what}: {r}")
+    }
+    return Ok(())
+}

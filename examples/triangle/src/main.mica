@@ -1,0 +1,166 @@
+// triangle [frames]: draws a colored triangle in an XCB window until it is
+// closed or Escape is pressed (or for `frames` frames). One frame in flight;
+// the swapchain is rebuilt when the window is resized.
+
+import std.io
+import std.env
+import std.time
+import vk
+import xcb
+import gpu
+import pipeline
+import swapchain
+
+struct Frame {
+    pool: vk.CommandPool
+    cmd: vk.CommandBuffer
+    /// signaled when the acquired image may be drawn to
+    ready: vk.Semaphore
+    /// signaled when the frame's commands finished
+    fence: vk.Fence
+}
+
+fn main() -> int {
+    let args = env.args()
+    let frames = if args.len() > 1 { args[1].to_int().unwrap_or(0) } else { 0 }
+    match run(frames) {
+        Ok(n) => {
+            io.print("{n} frames")
+            return 0
+        }
+        Err(e) => {
+            io.eprint("triangle: {e}")
+            return 1
+        }
+    }
+}
+
+fn run(frames: int) -> Result[int, str] {
+    var win = try xcb.open("vk triangle", 800, 600)
+    let g = try gpu.init(win)
+    let format = try g.surface_format()
+    let p = try pipeline.create(g, format.format)
+    let size = vk.Extent2D { width: win.width, height: win.height }
+    var sc = try swapchain.create(g, p.pass, format, try swapchain.extent(g, size), vk.SwapchainKHR {})
+    let f = try frame(g)
+
+    var drawn = 0
+    var stale = false
+    while win.poll() and (frames == 0 or drawn < frames) {
+        if stale {
+            let now = try swapchain.extent(g, size)
+            if now.width == 0 or now.height == 0 {
+                time.sleep_ms(16)
+                continue
+            }
+            discard try gpu.ok(g.dev.device_wait_idle(g.device), "vkDeviceWaitIdle")
+            let next = try swapchain.create(g, p.pass, format, now, sc.handle)
+            sc.destroy(g)
+            sc = next
+            stale = false
+        }
+        if try draw(g, p, sc, f) {
+            drawn += 1
+        } else {
+            stale = true
+        }
+    }
+
+    discard try gpu.ok(g.dev.device_wait_idle(g.device), "vkDeviceWaitIdle")
+    g.dev.destroy_fence(g.device, f.fence, Ptr.null())
+    g.dev.destroy_semaphore(g.device, f.ready, Ptr.null())
+    g.dev.destroy_command_pool(g.device, f.pool, Ptr.null())
+    sc.destroy(g)
+    p.destroy(g)
+    g.destroy()
+    return Ok(drawn)
+}
+
+fn frame(g: gpu.Gpu) -> Result[Frame, str] {
+    let pinfo = vk.CommandPoolCreateInfo { flags: vk.CommandPoolCreateFlags.RESET_COMMAND_BUFFER, queue_family_index: g.family }
+    var pool = vk.CommandPool {}
+    unsafe let rp = g.dev.create_command_pool(g.device, Ptr.of(pinfo), Ptr.null(), mut pool)
+    discard try gpu.ok(rp, "vkCreateCommandPool")
+    let ainfo = vk.CommandBufferAllocateInfo { command_pool: pool, level: vk.CommandBufferLevel.PRIMARY, command_buffer_count: 1 }
+    var cmds: List[vk.CommandBuffer] = [vk.CommandBuffer {}]
+    unsafe let ra = g.dev.allocate_command_buffers(g.device, Ptr.of(ainfo), cmds)
+    discard try gpu.ok(ra, "vkAllocateCommandBuffers")
+    let sinfo = vk.SemaphoreCreateInfo {}
+    var ready = vk.Semaphore {}
+    unsafe let rs = g.dev.create_semaphore(g.device, Ptr.of(sinfo), Ptr.null(), mut ready)
+    discard try gpu.ok(rs, "vkCreateSemaphore")
+    // Signaled, so the first frame does not wait.
+    let finfo = vk.FenceCreateInfo { flags: vk.FenceCreateFlags.SIGNALED }
+    var fence = vk.Fence {}
+    unsafe let rf = g.dev.create_fence(g.device, Ptr.of(finfo), Ptr.null(), mut fence)
+    discard try gpu.ok(rf, "vkCreateFence")
+    return Ok(Frame { pool, cmd: cmds[0], ready, fence })
+}
+
+/// Record and present one frame; false when the swapchain must be rebuilt.
+fn draw(g: gpu.Gpu, p: pipeline.Pipeline, sc: swapchain.Swapchain, f: Frame) -> Result[bool, str] {
+    let fences: List[vk.Fence] = [f.fence]
+    discard try gpu.ok(g.dev.wait_for_fences(g.device, 1, fences, vk.r#true, ~u64(0)), "vkWaitForFences")
+    var index: u32 = 0
+    let ra = g.sc.acquire_next_image_khr(g.device, sc.handle, ~u64(0), f.ready, vk.Fence {}, mut index)
+    if ra == vk.VkResult.ERROR_OUT_OF_DATE_KHR {
+        return Ok(false)
+    }
+    if ra != vk.VkResult.SUBOPTIMAL_KHR {
+        discard try gpu.ok(ra, "vkAcquireNextImageKHR")
+    }
+    discard try gpu.ok(g.dev.reset_fences(g.device, 1, fences), "vkResetFences")
+
+    let cmd = f.cmd
+    discard try gpu.ok(g.dev.reset_command_buffer(cmd, vk.CommandBufferResetFlags(0)), "vkResetCommandBuffer")
+    let binfo = vk.CommandBufferBeginInfo { flags: vk.CommandBufferUsageFlags.ONE_TIME_SUBMIT }
+    unsafe let rb = g.dev.begin_command_buffer(cmd, Ptr.of(binfo))
+    discard try gpu.ok(rb, "vkBeginCommandBuffer")
+    let clear = vk.ClearValue { color: vk.ClearColorValue { float32: [0.02, 0.02, 0.03, 1.0] } }
+    unsafe let rpinfo = vk.RenderPassBeginInfo {
+        render_pass: p.pass,
+        framebuffer: sc.framebuffers[index],
+        render_area: vk.Rect2D { extent: sc.extent },
+        clear_value_count: 1,
+        p_clear_values: Ptr.of(clear),
+    }
+    unsafe g.dev.cmd_begin_render_pass(cmd, Ptr.of(rpinfo), vk.SubpassContents.INLINE)
+    g.dev.cmd_bind_pipeline(cmd, vk.PipelineBindPoint.GRAPHICS, p.pipeline)
+    let viewport = vk.Viewport { width: f32(sc.extent.width), height: f32(sc.extent.height), max_depth: 1.0 }
+    let scissor = vk.Rect2D { extent: sc.extent }
+    unsafe {
+        g.dev.cmd_set_viewport(cmd, 0, 1, Ptr.of(viewport))
+        g.dev.cmd_set_scissor(cmd, 0, 1, Ptr.of(scissor))
+    }
+    g.dev.cmd_draw(cmd, 3, 1, 0, 0)
+    g.dev.cmd_end_render_pass(cmd)
+    discard try gpu.ok(g.dev.end_command_buffer(cmd), "vkEndCommandBuffer")
+
+    let stage = vk.PipelineStageFlags.COLOR_ATTACHMENT_OUTPUT
+    let done = sc.done[index]
+    unsafe let submit = vk.SubmitInfo {
+        wait_semaphore_count: 1,
+        p_wait_semaphores: Ptr.of(f.ready),
+        p_wait_dst_stage_mask: Ptr.of(stage),
+        command_buffer_count: 1,
+        p_command_buffers: Ptr.of(cmd),
+        signal_semaphore_count: 1,
+        p_signal_semaphores: Ptr.of(done),
+    }
+    unsafe let rs = g.dev.queue_submit(g.queue, 1, Ptr.of(submit), f.fence)
+    discard try gpu.ok(rs, "vkQueueSubmit")
+
+    unsafe let present = vk.PresentInfoKHR {
+        wait_semaphore_count: 1,
+        p_wait_semaphores: Ptr.of(done),
+        swapchain_count: 1,
+        p_swapchains: Ptr.of(sc.handle),
+        p_image_indices: Ptr.of(index),
+    }
+    unsafe let rq = g.sc.queue_present_khr(g.queue, Ptr.of(present))
+    if rq == vk.VkResult.ERROR_OUT_OF_DATE_KHR or rq == vk.VkResult.SUBOPTIMAL_KHR {
+        return Ok(false)
+    }
+    discard try gpu.ok(rq, "vkQueuePresentKHR")
+    return Ok(true)
+}

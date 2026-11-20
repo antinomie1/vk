@@ -1,0 +1,251 @@
+// Resource handles and their creation. Handles are small Copy values: a
+// generational slot, the device they belong to, and what callers like to
+// read (size, format, address). Everything Vulkan lives in the `Device`;
+// commands name resources by handle and are checked at submit, so a
+// destroyed or foreign handle is an error, never a dangling Vulkan object.
+
+import std.collections.slotmap
+import vk
+import ctx
+import alloc
+import sync
+
+/// A 2D image. Its `index()` addresses it in the bindless arrays.
+pub struct Texture {
+    h: slotmap.Handle
+    dev: u64
+    width: u32
+    height: u32
+    format: vk.Format
+    /// Imported: owned by its producer between `acquire` and `release`.
+    ext: bool = false
+}
+
+/// Bindless slot; a destroyed texture's slot samples transparent black.
+pub fn Texture.index(self) -> u32 {
+    return self.h.index
+}
+
+pub fn Texture.width(self) -> u32 {
+    return self.width
+}
+
+pub fn Texture.height(self) -> u32 {
+    return self.height
+}
+
+pub fn Texture.format(self) -> vk.Format {
+    return self.format
+}
+
+/// Imported from another process (`Device.import_dmabuf`).
+pub fn Texture.imported(self) -> bool {
+    return self.ext
+}
+
+/// A buffer; shaders reach it through `addr()` (buffer device address).
+pub struct Buffer {
+    h: slotmap.Handle
+    dev: u64
+    addr: u64
+    size: u64
+}
+
+pub fn Buffer.addr(self) -> u64 {
+    return self.addr
+}
+
+pub fn Buffer.size(self) -> u64 {
+    return self.size
+}
+
+pub struct Pipeline {
+    h: slotmap.Handle
+    dev: u64
+    point: vk.PipelineBindPoint
+}
+
+/// A point on the device timeline: every submit returns the next one.
+pub struct Ticket {
+    value: u64 = 0
+}
+
+/// Bytes copied into this frame's upload ring; valid until the submit
+/// that follows them completes.
+pub struct Staged {
+    buffer: vk.Buffer
+    offset: u64
+    addr: u64
+}
+
+/// Device address of the bytes, for push constants.
+pub fn Staged.addr(self) -> u64 {
+    return self.addr
+}
+
+pub struct TextureDesc {
+    pub width: u32
+    pub height: u32
+    pub format: vk.Format = vk.Format.R8G8B8A8_UNORM
+    /// Rendered into (as color, or as depth for a depth format).
+    pub target: bool = false
+    /// Written with imageStore (binding 2).
+    pub storage: bool = false
+}
+
+struct TexInfo {
+    image: vk.Image
+    view: vk.ImageView
+    mem: alloc.Alloc
+    state: sync.Use
+    /// false for swapchain images, which the device does not own.
+    owned: bool
+    format: vk.Format
+    width: u32
+    height: u32
+    aspect: vk.ImageAspectFlags
+    /// A swapchain image: not in the bindless arrays, never published.
+    sc: bool = false
+    ext: bool = false
+    /// Usages it was made with.
+    target: bool = false
+    storage: bool = false
+    copy: bool = true
+    /// Destroyed: rejected by every check, freed once the GPU is done.
+    dead: bool = false
+}
+
+struct BufInfo {
+    raw: vk.Buffer
+    mem: alloc.Alloc
+    dead: bool = false
+}
+
+struct PipeInfo {
+    raw: vk.Pipeline
+    point: vk.PipelineBindPoint
+    /// Target formats a graphics pipeline was built for.
+    color: vk.Format
+    depth: vk.Format
+    dead: bool = false
+}
+
+fn is_depth(f: vk.Format) -> bool {
+    return f == vk.Format.D16_UNORM or f == vk.Format.D32_SFLOAT or f == vk.Format.X8_D24_UNORM_PACK32 or f == vk.Format.D24_UNORM_S8_UINT or f == vk.Format.D32_SFLOAT_S8_UINT or f == vk.Format.D16_UNORM_S8_UINT
+}
+
+fn aspect(f: vk.Format) -> vk.ImageAspectFlags {
+    return if is_depth(f) { vk.ImageAspectFlags.DEPTH } else { vk.ImageAspectFlags.COLOR }
+}
+
+/// Bytes per texel of the formats copies support; 0 for others.
+fn texel_size(f: vk.Format) -> u64 {
+    return match f {
+        R8_UNORM => 1
+        R8G8_UNORM => 2
+        R8G8B8A8_UNORM or R8G8B8A8_SRGB or B8G8R8A8_UNORM or B8G8R8A8_SRGB or R32_SFLOAT or R32_UINT or D32_SFLOAT => 4
+        R16G16B16A16_SFLOAT => 8
+        R32G32B32A32_SFLOAT => 16
+        _ => 0
+    }
+}
+
+fn view(cx: ctx.Ctx, image: vk.Image, format: vk.Format) -> Result[vk.ImageView, str] {
+    let info = vk.ImageViewCreateInfo {
+        image,
+        view_type: vk.ImageViewType.TYPE_2D,
+        format,
+        subresource_range: vk.ImageSubresourceRange { aspect_mask: aspect(format), level_count: 1, layer_count: 1 },
+    }
+    var v = vk.ImageView {}
+    unsafe let r = cx.fns.create_image_view(cx.device, Ptr.of(info), Ptr.null(), mut v)
+    try ctx.ok(r, "vkCreateImageView")
+    return Ok(v)
+}
+
+fn create_texture(cx: ctx.Ctx, mut mem: alloc.Allocator, d: TextureDesc) -> Result[TexInfo, str] {
+    var usage = vk.ImageUsageFlags.SAMPLED | vk.ImageUsageFlags.TRANSFER_SRC | vk.ImageUsageFlags.TRANSFER_DST
+    if d.target {
+        usage |= if is_depth(d.format) { vk.ImageUsageFlags.DEPTH_STENCIL_ATTACHMENT } else { vk.ImageUsageFlags.COLOR_ATTACHMENT }
+    }
+    if d.storage {
+        usage |= vk.ImageUsageFlags.STORAGE
+    }
+    let info = vk.ImageCreateInfo {
+        image_type: vk.ImageType.TYPE_2D,
+        format: d.format,
+        extent: vk.Extent3D { width: d.width, height: d.height, depth: 1 },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: vk.SampleCountFlags.TYPE_1,
+        tiling: vk.ImageTiling.OPTIMAL,
+        usage,
+        sharing_mode: vk.SharingMode.EXCLUSIVE,
+        initial_layout: vk.ImageLayout.UNDEFINED,
+    }
+    var image = vk.Image {}
+    unsafe let r = cx.fns.create_image(cx.device, Ptr.of(info), Ptr.null(), mut image)
+    try ctx.ok(r, "vkCreateImage")
+    var req = vk.MemoryRequirements {}
+    cx.fns.get_image_memory_requirements(cx.device, image, mut req)
+    let a = match mem.alloc(cx, req, alloc.Mem.Gpu, false) {
+        Ok(a) => a
+        Err(e) => {
+            cx.fns.destroy_image(cx.device, image, Ptr.null())
+            return Err(e)
+        }
+    }
+    try ctx.ok(cx.fns.bind_image_memory(cx.device, image, a.memory, a.offset), "vkBindImageMemory")
+    let v = try view(cx, image, d.format)
+    return Ok(TexInfo {
+        image,
+        view: v,
+        mem: a,
+        state: sync.Use.Undefined,
+        owned: true,
+        format: d.format,
+        width: d.width,
+        height: d.height,
+        aspect: aspect(d.format),
+        target: d.target,
+        storage: d.storage,
+    })
+}
+
+fn create_buffer(cx: ctx.Ctx, mut mem: alloc.Allocator, size: u64, m: alloc.Mem) -> Result[BufInfo, str] {
+    let usage = vk.BufferUsageFlags.TRANSFER_SRC | vk.BufferUsageFlags.TRANSFER_DST | vk.BufferUsageFlags.UNIFORM_BUFFER | vk.BufferUsageFlags.STORAGE_BUFFER | vk.BufferUsageFlags.INDEX_BUFFER | vk.BufferUsageFlags.VERTEX_BUFFER | vk.BufferUsageFlags.INDIRECT_BUFFER | vk.BufferUsageFlags.SHADER_DEVICE_ADDRESS
+    let info = vk.BufferCreateInfo { size, usage, sharing_mode: vk.SharingMode.EXCLUSIVE }
+    var raw = vk.Buffer {}
+    unsafe let r = cx.fns.create_buffer(cx.device, Ptr.of(info), Ptr.null(), mut raw)
+    try ctx.ok(r, "vkCreateBuffer")
+    var req = vk.MemoryRequirements {}
+    cx.fns.get_buffer_memory_requirements(cx.device, raw, mut req)
+    let a = match mem.alloc(cx, req, m, true) {
+        Ok(a) => a
+        Err(e) => {
+            cx.fns.destroy_buffer(cx.device, raw, Ptr.null())
+            return Err(e)
+        }
+    }
+    try ctx.ok(cx.fns.bind_buffer_memory(cx.device, raw, a.memory, a.offset), "vkBindBufferMemory")
+    return Ok(BufInfo { raw, mem: a })
+}
+
+fn address(cx: ctx.Ctx, b: vk.Buffer) -> u64 {
+    let info = vk.BufferDeviceAddressInfo { buffer: b }
+    unsafe let addr = cx.v12.get_buffer_device_address(cx.device, Ptr.of(info))
+    return addr
+}
+
+/// A shader module from SPIR-V; `code` must be 4-byte aligned (`embed`
+/// data and heap strings are).
+fn module(cx: ctx.Ctx, code: str) -> Result[vk.ShaderModule, str] {
+    guard code.len() % 4 == 0 and code.len() > 0 else {
+        return Err("SPIR-V size {code.len()} is not a positive multiple of 4")
+    }
+    unsafe let info = vk.ShaderModuleCreateInfo { code_size: usize(code.len()), p_code: code.as_cstr().cast[u32]() }
+    var m = vk.ShaderModule {}
+    unsafe let r = cx.fns.create_shader_module(cx.device, Ptr.of(info), Ptr.null(), mut m)
+    try ctx.ok(r, "vkCreateShaderModule")
+    return Ok(m)
+}

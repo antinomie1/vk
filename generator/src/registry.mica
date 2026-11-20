@@ -1,0 +1,571 @@
+// The Vulkan registry model: types, enums, commands, constants and the
+// features/extensions that require them, read from vk.xml and video.xml
+// for the `vulkan` API.
+
+import std.fmt
+import std.str
+import std.collections.map
+import xml
+import names
+
+/// A struct member, command parameter or function-pointer parameter.
+pub struct Member {
+    name: str
+    ty: str
+    is_const: bool
+    ptrs: int
+    dims: List[str]
+    bits: int
+    optional: bool
+    len: str
+    values: str
+}
+
+pub struct TypeDef {
+    name: str
+    /// struct, union, handle, enum, bitmask, basetype, funcpointer, external
+    cat: str
+    alias: str
+    members: List[Member]
+    /// bitmask: its `FlagBits` enum; basetype: the typedef target
+    base: str
+    /// handle: dispatchable; bitmask: 64-bit
+    flag: bool
+    /// basetype: the C text
+    text: str
+    /// funcpointer: return type
+    ret: Member
+}
+
+pub struct EnumVal {
+    name: str
+    value: str
+}
+
+pub struct EnumDef {
+    name: str
+    bitmask: bool
+    vals: List[EnumVal]
+}
+
+pub struct Command {
+    name: str
+    alias: str
+    ret: Member
+    params: List[Member]
+}
+
+/// A core version (`name` "V1_0") or an extension (`name` "KhrSwapchain").
+pub struct Group {
+    name: str
+    ext: bool
+    /// the `depends` expression of a split-off part of an extension
+    depends: str
+    /// declared in `vulkan_core.h` / `vulkan_beta.h`, not a platform header
+    core: bool
+    commands: List[str]
+    types: List[str]
+}
+
+pub struct Constant {
+    name: str
+    ty: str
+    value: str
+}
+
+pub struct Registry {
+    types: List[TypeDef]
+    type_ix: map.Map[str, int]
+    enums: List[EnumDef]
+    enum_ix: map.Map[str, int]
+    commands: List[Command]
+    cmd_ix: map.Map[str, int]
+    groups: List[Group]
+    consts: List[Constant]
+    const_ix: map.Map[str, int]
+    tags: List[str]
+    versions: List[str]
+    header_version: int
+}
+
+pub fn new() -> Registry {
+    return Registry {
+        types: [], type_ix: map.Map.new(), enums: [], enum_ix: map.Map.new(), commands: [], cmd_ix: map.Map.new(),
+        groups: [], consts: [], const_ix: map.Map.new(), tags: [], versions: [], header_version: 0,
+    }
+}
+
+/// `api` attribute lists `vulkan` (or is absent).
+fn api_ok(d: xml.Doc, n: int) -> bool {
+    let a = d.attr(n, "api")
+    return a.is_empty() or a.split(",").contains("vulkan")
+}
+
+/// Read one registry document (vk.xml or video.xml).
+pub fn load(mut r: Registry, d: xml.Doc) -> Result[bool, str] {
+    guard let Some(root) = d.elems(0, "registry").first() else {
+        return Err("no <registry> element")
+    }
+    for sec in d.elems(root, "") {
+        match d.name(sec) {
+            "tags" => {
+                for t in d.elems(sec, "tag") {
+                    r.tags.push(d.attr(t, "name"))
+                }
+            }
+            "types" => {
+                for t in d.elems(sec, "type") {
+                    if api_ok(d, t) {
+                        type_def(mut r, d, t)
+                    }
+                }
+            }
+            "enums" => enums(mut r, d, sec)
+            "commands" => {
+                for c in d.elems(sec, "command") {
+                    if api_ok(d, c) {
+                        command(mut r, d, c)
+                    }
+                }
+            }
+            "feature" => {
+                if api_ok(d, sec) {
+                    let num = d.attr(sec, "number").replace(".", "_")
+                    if not r.versions.contains(num) {
+                        r.versions.push(num.clone())
+                    }
+                    discard try group(mut r, d, sec, "V" + num, false, 0)
+                }
+            }
+            "extensions" => {
+                for e in d.elems(sec, "extension") {
+                    let sup = d.attr(e, "supported")
+                    if sup.is_empty() or sup.split(",").contains("vulkan") {
+                        let num = names.parse_int(d.attr(e, "number")).unwrap_or(0)
+                        discard try group(mut r, d, e, names.extension(d.attr(e, "name")), true, num)
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    return Ok(true)
+}
+
+fn type_def(mut r: Registry, d: xml.Doc, t: int) {
+    let cat = d.attr(t, "category")
+    var name = d.attr(t, "name")
+    if name.is_empty() {
+        let nn = d.first(t, "name")
+        if nn >= 0 {
+            name = d.text(nn)
+        } else {
+            let pn = d.first(t, "proto")
+            if pn >= 0 {
+                name = d.text(d.first(pn, "name"))
+            }
+        }
+    }
+    guard not name.is_empty() else {
+        return
+    }
+    // A header stub (`requires="vk_video/..."`) gives way to the definition.
+    var slot = -1
+    if let Some(i) = r.type_ix.get(name) {
+        guard r.types[i].cat == "external" and not cat.is_empty() else {
+            return
+        }
+        slot = i
+    }
+    var td = TypeDef { name: name.clone(), cat: cat.clone(), alias: d.attr(t, "alias"), members: [], base: "", flag: false, text: "", ret: empty() }
+    match cat {
+        "struct" or "union" => {
+            for m in d.elems(t, "member") {
+                if api_ok(d, m) {
+                    td.members.push(member(d, m))
+                }
+            }
+        }
+        "handle" => {
+            td.flag = d.text(d.first(t, "type")) == "VK_DEFINE_HANDLE"
+        }
+        "bitmask" => {
+            td.base = if d.has(t, "bitvalues") { d.attr(t, "bitvalues") } else { d.attr(t, "requires") }
+            td.flag = d.text(d.first(t, "type")) == "VkFlags64"
+        }
+        "basetype" => {
+            let tn = d.first(t, "type")
+            td.base = if tn >= 0 { d.text(tn) } else { "" }
+            td.text = d.text(t)
+        }
+        "funcpointer" => {
+            td.ret = member(d, d.first(t, "proto"))
+            for p in d.elems(t, "param") {
+                td.members.push(member(d, p))
+            }
+        }
+        "enum" => {}
+        "" => {
+            let req = d.attr(t, "requires")
+            guard not req.is_empty() and req != "vk_platform" and req != "stdint" else {
+                return
+            }
+            td.cat = "external"
+        }
+        _ => {
+            if cat == "define" and name == "VK_HEADER_VERSION" {
+                let txt = d.text(t)
+                if let Some(i) = txt.find("VK_HEADER_VERSION") {
+                    r.header_version = names.parse_int(txt.slice(i + 17, txt.len())).unwrap_or(0)
+                }
+            }
+            return
+        }
+    }
+    if slot >= 0 {
+        r.types[slot] = td
+        return
+    }
+    discard r.type_ix.insert(name, r.types.len())
+    r.types.push(td)
+}
+
+fn empty() -> Member {
+    return Member { name: "", ty: "", is_const: false, ptrs: 0, dims: [], bits: 0, optional: false, len: "", values: "" }
+}
+
+/// `const <type>char</type>* <name>pName</name>[<enum>N</enum>]`.
+fn member(d: xml.Doc, n: int) -> Member {
+    var m = empty()
+    m.optional = d.attr(n, "optional").starts_with("true")
+    m.len = d.attr(n, "len")
+    m.values = d.attr(n, "values")
+    var pre = ""
+    var mid = ""
+    var post = ""
+    var state = 0
+    for k in d.nodes[n].kids {
+        let kn = d.name(k)
+        if kn == "type" {
+            m.ty = d.text(k)
+            state = 1
+        } else if kn == "name" {
+            m.name = d.text(k)
+            state = 2
+        } else if kn != "comment" {
+            let txt = d.text(k)
+            if state == 0 {
+                pre += txt
+            } else if state == 1 {
+                mid += txt
+            } else {
+                post += txt
+            }
+        }
+    }
+    m.is_const = pre.contains("const")
+    m.ptrs = mid.count("*")
+    var rest = post.trim()
+    while rest.starts_with("[") {
+        guard let Some(e) = rest.find("]") else {
+            break
+        }
+        m.dims.push(rest.slice(1, e).trim())
+        rest = rest.slice(e + 1, rest.len()).trim()
+    }
+    if rest.starts_with(":") {
+        m.bits = names.parse_int(rest.slice(1, rest.len())).unwrap_or(0)
+    }
+    return m
+}
+
+fn enums(mut r: Registry, d: xml.Doc, sec: int) {
+    let name = d.attr(sec, "name")
+    let kind = d.attr(sec, "type")
+    if kind == "constants" or name == "API Constants" {
+        for e in d.elems(sec, "enum") {
+            if not d.has(e, "alias") and api_ok(d, e) {
+                constant(mut r, d.attr(e, "name"), d.attr(e, "type"), d.attr(e, "value"))
+            }
+        }
+        return
+    }
+    let ix = enum_def(mut r, name, kind == "bitmask")
+    for e in d.elems(sec, "enum") {
+        if api_ok(d, e) {
+            enum_val(mut r, d, e, ix, 0)
+        }
+    }
+}
+
+fn enum_def(mut r: Registry, name: str, bitmask: bool) -> int {
+    if let Some(i) = r.enum_ix.get(name) {
+        return i
+    }
+    let i = r.enums.len()
+    discard r.enum_ix.insert(name.clone(), i)
+    r.enums.push(EnumDef { name: name.clone(), bitmask, vals: [] })
+    return i
+}
+
+/// Add enum value `e` to enum `ix`: `value`, `bitpos` or extension `offset`.
+fn enum_val(mut r: Registry, d: xml.Doc, e: int, ix: int, extnum: int) {
+    guard not d.has(e, "alias") else {
+        return
+    }
+    let name = d.attr(e, "name")
+    for v in r.enums[ix].vals {
+        if v.name == name {
+            return
+        }
+    }
+    var value = ""
+    if d.has(e, "bitpos") {
+        let pos = names.parse_int(d.attr(e, "bitpos")).unwrap_or(0)
+        value = "0x" + fmt.hex_u64(u64(1) << u64(pos))
+    } else if d.has(e, "offset") {
+        let num = if d.has(e, "extnumber") { names.parse_int(d.attr(e, "extnumber")).unwrap_or(0) } else { extnum }
+        let v = 1000000000 + (num - 1) * 1000 + names.parse_int(d.attr(e, "offset")).unwrap_or(0)
+        value = if d.attr(e, "dir") == "-" { "-{v}" } else { "{v}" }
+    } else {
+        value = d.attr(e, "value")
+    }
+    r.enums[ix].vals.push(EnumVal { name, value })
+}
+
+/// API and extension constants: C literal -> Mica literal.
+fn constant(mut r: Registry, name: str, ty: str, value: str) {
+    guard not r.const_ix.contains(name) else {
+        return
+    }
+    let v = value.trim()
+    var out = ""
+    if v.starts_with("\"") {
+        out = v
+    } else if v.starts_with("(~") {
+        let n = names.parse_int(v.slice(2, v.len()).replace("ULL)", "").replace("U)", "")).unwrap_or(0)
+        out = if v.contains("ULL") { "{~u64(n)}" } else { "{~u32(n)}" }
+    } else if v.ends_with("F") or v.ends_with("f") {
+        out = v.slice(0, v.len() - 1)
+    } else if names.parse_int(v).is_some() {
+        out = v
+    } else {
+        return
+    }
+    let mty = match ty {
+        "uint32_t" => "u32"
+        "uint64_t" => "u64"
+        "int32_t" => "i32"
+        "float" => "f32"
+        _ => ""
+    }
+    discard r.const_ix.insert(name.clone(), r.consts.len())
+    r.consts.push(Constant { name: name.clone(), ty: mty, value: out })
+}
+
+fn command(mut r: Registry, d: xml.Doc, c: int) {
+    var cmd = Command { name: d.attr(c, "name"), alias: d.attr(c, "alias"), ret: empty(), params: [] }
+    let proto = d.first(c, "proto")
+    if proto >= 0 {
+        cmd.ret = member(d, proto)
+        cmd.name = cmd.ret.name.clone()
+        for p in d.elems(c, "param") {
+            if api_ok(d, p) {
+                cmd.params.push(member(d, p))
+            }
+        }
+    }
+    guard not r.cmd_ix.contains(cmd.name) else {
+        return
+    }
+    discard r.cmd_ix.insert(cmd.name.clone(), r.commands.len())
+    r.commands.push(cmd)
+}
+
+/// A `<feature>` or `<extension>`: its commands, types, enum values and
+/// constants. Versions with one number share a group.
+fn group(mut r: Registry, d: xml.Doc, n: int, name: str, ext: bool, extnum: int) -> Result[bool, str] {
+    let platform = d.attr(n, "platform")
+    let core = platform.is_empty() or platform == "provisional"
+    let base = try group_ix(mut r, name, ext, "", core)
+    for req in d.elems(n, "require") {
+        guard api_ok(d, req) else {
+            continue
+        }
+        // An extension's commands that exist only with another version or
+        // extension (`depends`) get their own group, so the base table
+        // loads without them: `KhrSwapchainV1_1`.
+        let dep = d.attr(req, "depends")
+        let gi = if ext and not dep.is_empty() { try group_ix(mut r, name + depends_name(dep), ext, dep, core) } else { base }
+        for k in d.elems(req, "") {
+            guard api_ok(d, k) else {
+                continue
+            }
+            let kn = d.attr(k, "name")
+            match d.name(k) {
+                "command" => {
+                    if not r.groups[gi].commands.contains(kn) {
+                        r.groups[gi].commands.push(kn)
+                    }
+                }
+                "type" => r.groups[gi].types.push(kn)
+                "enum" => {
+                    let ext_of = d.attr(k, "extends")
+                    if not ext_of.is_empty() {
+                        let bitmask = d.has(k, "bitpos")
+                        let ix = enum_def(mut r, ext_of, bitmask)
+                        enum_val(mut r, d, k, ix, extnum)
+                    } else if d.has(k, "value") and not d.has(k, "alias") {
+                        constant(mut r, kn, d.attr(k, "type"), d.attr(k, "value"))
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    return Ok(true)
+}
+
+/// The group `name`, created if new. Two `depends` expressions that map to
+/// one name would share a table (and break its `try_load`): an error.
+fn group_ix(mut r: Registry, name: str, ext: bool, depends: str, core: bool) -> Result[int, str] {
+    for i, g in r.groups {
+        if g.name == name {
+            guard g.depends == depends else {
+                return Err("`depends` \"{g.depends}\" and \"{depends}\" both name table `{name}`")
+            }
+            return Ok(i)
+        }
+    }
+    r.groups.push(Group { name: name.clone(), ext, depends: depends.clone(), core, commands: [], types: [] })
+    return Ok(r.groups.len() - 1)
+}
+
+/// `VK_VERSION_1_1,VK_KHR_device_group` -> `V1_1OrKhrDeviceGroup`: `,` is
+/// `Or`, `+` is `And`, and a parenthesized group starts with `Either` (its
+/// operator is `,`) or `Both` (`+`): `(A,B)+C` -> `EitherAOrBAndC`.
+pub fn depends_name(dep: str) -> str {
+    var out = ""
+    var tok = ""
+    let s = dep + ","
+    for i in 0..s.len() {
+        let b = s[i]
+        guard b == 44 or b == 43 or b == 40 or b == 41 else {
+            tok += str.from_byte(b)
+            continue
+        }
+        if not tok.is_empty() {
+            out += if tok.starts_with("VK_VERSION_") { "V" + tok.slice(11, tok.len()) } else { names.extension(tok) }
+            tok = ""
+        }
+        if b == 44 {
+            out += "Or"
+        } else if b == 43 {
+            out += "And"
+        } else if b == 40 {
+            out += if group_op(s, i + 1) == 43 { "Both" } else { "Either" }
+        }
+    }
+    return out.strip_suffix("Or").unwrap_or(out)
+}
+
+/// The first operator at depth 0 of the group starting at `i`.
+fn group_op(s: str, i: int) -> u8 {
+    var depth = 0
+    for j in i..s.len() {
+        let b = s[j]
+        if b == 40 {
+            depth += 1
+        } else if b == 41 {
+            if depth == 0 {
+                return 0
+            }
+            depth -= 1
+        } else if depth == 0 and (b == 44 or b == 43) {
+            return b
+        }
+    }
+    return 0
+}
+
+/// The canonical definition of `name` (aliases followed), or -1.
+pub fn Registry.resolve(self, name: str) -> int {
+    var cur = name.clone()
+    for _ in 0..8 {
+        guard let Some(i) = self.type_ix.get(cur) else {
+            return -1
+        }
+        if self.types[i].alias.is_empty() {
+            return i
+        }
+        cur = self.types[i].alias.clone()
+    }
+    return -1
+}
+
+/// Types reachable from the commands and types the groups require
+/// (`core_only`: only groups in `vulkan_core.h` / `vulkan_beta.h`).
+pub fn Registry.live(self, core_only: bool) -> List[bool] {
+    var live: List[bool] = []
+    for _ in self.types {
+        live.push(false)
+    }
+    var work: List[str] = []
+    for g in self.groups {
+        if core_only and not g.core {
+            continue
+        }
+        for t in g.types {
+            work.push(t.clone())
+        }
+        for c in g.commands {
+            if let Some(ci) = self.cmd_ix.get(c) {
+                let cmd = self.command_of(ci)
+                work.push(cmd.ret.ty.clone())
+                for p in cmd.params {
+                    work.push(p.ty.clone())
+                }
+            }
+        }
+    }
+    while true {
+        guard let Some(t) = work.pop() else {
+            break
+        }
+        guard let Some(i) = self.type_ix.get(t) else {
+            continue
+        }
+        if live[i] {
+            continue
+        }
+        live[i] = true
+        deps(self.types[i], mut work)
+    }
+    return live
+}
+
+/// Command `ci` with its alias resolved to the defining command.
+pub fn Registry.command_of(self, ci: int) -> Command {
+    var c = self.commands[ci].clone()
+    if not c.alias.is_empty() {
+        if let Some(ti) = self.cmd_ix.get(c.alias) {
+            let target = self.command_of(ti)
+            return Command { name: c.name.clone(), alias: c.alias.clone(), ..target }
+        }
+    }
+    return c
+}
+
+/// Types `td` refers to.
+fn deps(td: TypeDef, mut work: List[str]) {
+    if not td.alias.is_empty() {
+        work.push(td.alias.clone())
+    }
+    if not td.base.is_empty() {
+        work.push(td.base.clone())
+    }
+    work.push(td.ret.ty.clone())
+    for m in td.members {
+        work.push(m.ty.clone())
+    }
+}

@@ -1,0 +1,113 @@
+// The swapchain with a view, framebuffer and "rendering done" semaphore per
+// image; rebuilt when the window size changes.
+
+import vk
+import gpu
+
+pub struct Swapchain {
+    handle: vk.SwapchainKHR
+    extent: vk.Extent2D
+    framebuffers: List[vk.Framebuffer]
+    views: List[vk.ImageView]
+    /// signaled by the submit that draws image i, waited by its present
+    done: List[vk.Semaphore]
+}
+
+/// The surface size now (`fallback` when the window system leaves it to us);
+/// 0 x 0 while minimized.
+pub fn extent(g: gpu.Gpu, fallback: vk.Extent2D) -> Result[vk.Extent2D, str] {
+    var caps = vk.SurfaceCapabilitiesKHR {}
+    discard try gpu.ok(g.surf.get_physical_device_surface_capabilities_khr(g.pdev, g.surface, mut caps), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+    guard caps.current_extent.width == 0xFFFFFFFF else {
+        return Ok(caps.current_extent)
+    }
+    return Ok(vk.Extent2D {
+        width: max(caps.min_image_extent.width, min(fallback.width, caps.max_image_extent.width)),
+        height: max(caps.min_image_extent.height, min(fallback.height, caps.max_image_extent.height)),
+    })
+}
+
+pub fn create(g: gpu.Gpu, pass: vk.RenderPass, format: vk.SurfaceFormatKHR, size: vk.Extent2D, old: vk.SwapchainKHR) -> Result[Swapchain, str] {
+    var caps = vk.SurfaceCapabilitiesKHR {}
+    discard try gpu.ok(g.surf.get_physical_device_surface_capabilities_khr(g.pdev, g.surface, mut caps), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR")
+    var count = caps.min_image_count + 1
+    if caps.max_image_count > 0 and count > caps.max_image_count {
+        count = caps.max_image_count
+    }
+    var alpha = vk.CompositeAlphaFlagsKHR.OPAQUE
+    for a in [vk.CompositeAlphaFlagsKHR.OPAQUE, vk.CompositeAlphaFlagsKHR.INHERIT, vk.CompositeAlphaFlagsKHR.PRE_MULTIPLIED, vk.CompositeAlphaFlagsKHR.POST_MULTIPLIED] {
+        if caps.supported_composite_alpha.contains(a) {
+            alpha = a
+            break
+        }
+    }
+    let info = vk.SwapchainCreateInfoKHR {
+        surface: g.surface,
+        min_image_count: count,
+        image_format: format.format,
+        image_color_space: format.color_space,
+        image_extent: size,
+        image_array_layers: 1,
+        image_usage: vk.ImageUsageFlags.COLOR_ATTACHMENT,
+        image_sharing_mode: vk.SharingMode.EXCLUSIVE,
+        pre_transform: caps.current_transform,
+        composite_alpha: alpha,
+        present_mode: vk.PresentModeKHR.FIFO,
+        clipped: vk.r#true,
+        old_swapchain: old,
+    }
+    var handle = vk.SwapchainKHR {}
+    unsafe let r = g.sc.create_swapchain_khr(g.device, Ptr.of(info), Ptr.null(), mut handle)
+    discard try gpu.ok(r, "vkCreateSwapchainKHR")
+
+    var n: u32 = 0
+    discard try gpu.ok(g.sc.get_swapchain_images_khr(g.device, handle, mut n, Ptr.null()), "vkGetSwapchainImagesKHR")
+    var images: List[vk.Image] = []
+    for _ in 0..n {
+        images.push(vk.Image {})
+    }
+    discard try gpu.ok(g.sc.get_swapchain_images_khr(g.device, handle, mut n, images), "vkGetSwapchainImagesKHR")
+
+    var sc = Swapchain { handle, extent: size, framebuffers: [], views: [], done: [] }
+    for image in images {
+        let vinfo = vk.ImageViewCreateInfo {
+            image,
+            view_type: vk.ImageViewType.TYPE_2D,
+            format: format.format,
+            subresource_range: vk.ImageSubresourceRange { aspect_mask: vk.ImageAspectFlags.COLOR, level_count: 1, layer_count: 1 },
+        }
+        var view = vk.ImageView {}
+        unsafe let rv = g.dev.create_image_view(g.device, Ptr.of(vinfo), Ptr.null(), mut view)
+        discard try gpu.ok(rv, "vkCreateImageView")
+        sc.views.push(view)
+
+        unsafe let finfo = vk.FramebufferCreateInfo {
+            render_pass: pass,
+            attachment_count: 1,
+            p_attachments: Ptr.of(view),
+            width: size.width,
+            height: size.height,
+            layers: 1,
+        }
+        var fb = vk.Framebuffer {}
+        unsafe let rf = g.dev.create_framebuffer(g.device, Ptr.of(finfo), Ptr.null(), mut fb)
+        discard try gpu.ok(rf, "vkCreateFramebuffer")
+        sc.framebuffers.push(fb)
+
+        let sinfo = vk.SemaphoreCreateInfo {}
+        var sem = vk.Semaphore {}
+        unsafe let rs = g.dev.create_semaphore(g.device, Ptr.of(sinfo), Ptr.null(), mut sem)
+        discard try gpu.ok(rs, "vkCreateSemaphore")
+        sc.done.push(sem)
+    }
+    return Ok(sc)
+}
+
+pub fn Swapchain.destroy(self, g: gpu.Gpu) {
+    for i in 0..self.views.len() {
+        g.dev.destroy_framebuffer(g.device, self.framebuffers[i], Ptr.null())
+        g.dev.destroy_image_view(g.device, self.views[i], Ptr.null())
+        g.dev.destroy_semaphore(g.device, self.done[i], Ptr.null())
+    }
+    g.sc.destroy_swapchain_khr(g.device, self.handle, Ptr.null())
+}

@@ -1,0 +1,9 @@
+[package]
+name = "vk_compose"
+version = "0.1.0"
+description = "A compositor frame on draw2d: views over textures and dmabufs, damage by buffer age"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+vk_gpu = { path = "../vk_gpu" }
+vk_draw2d = { path = "../vk_draw2d" }

@@ -1,0 +1,197 @@
+// Recording. An `Encoder` is a list of commands naming resources by handle;
+// it touches no Vulkan object. `Device.submit` checks every handle and
+// argument, then translates the list into a command buffer (record.mica),
+// so a mistake is an `Err` before anything reaches the driver. Passes and
+// compute work are scopes: `render` and `compute` hand their closure a
+// `Render` / `Compute` that can only record what is legal inside them.
+
+import std.mem
+import res
+
+pub enum Load {
+    Clear
+    Keep
+    Discard
+}
+
+pub struct Pass {
+    pub target: res.Texture
+    pub load: Load = Load.Clear
+    pub clear: [4]f32 = [0.0, 0.0, 0.0, 1.0]
+    /// A depth texture of the target's size, tested and written by depth pipelines.
+    pub depth: Option[res.Texture] = None
+    pub depth_load: Load = Load.Clear
+    pub depth_clear: f32 = 1.0
+}
+
+enum Cmd {
+    Begin(Pass)
+    End
+    BeginCompute
+    EndCompute
+    Bind(res.Pipeline)
+    /// Push constants: offset and length in `Lists.bytes`.
+    Push(u32, u32)
+    Draw(u32, u32)
+    DrawIndexed(res.Buffer, u32, u32)
+    DrawIndirect(res.Buffer, u64, u32)
+    Scissor(i32, i32, u32, u32)
+    Dispatch(u32, u32, u32)
+    DispatchIndirect(res.Buffer, u64)
+    ComputeBarrier
+    Storage(res.Texture)
+    /// Upload-ring bytes into a buffer: source, offset, target, offset, size.
+    Copy(res.Staged, res.Buffer, u64, u64)
+    /// Upload-ring bytes into all of a texture.
+    Upload(res.Staged, res.Texture)
+    /// All of a texture into a buffer, tightly packed.
+    Download(res.Texture, res.Buffer)
+    Acquire(res.Texture)
+    Release(res.Texture)
+    Present(res.Texture)
+}
+
+/// What an encoder records, recycled by the device between encoders.
+struct Lists {
+    cmds: List[Cmd] = []
+    bytes: List[u8] = []
+}
+
+pub struct Encoder {
+    dev: u64
+    l: Lists
+}
+
+fn new(dev: u64, take l: Lists) -> Encoder {
+    return Encoder { dev, l }
+}
+
+fn Encoder.recycle(take self) -> Lists {
+    var e = self
+    var l = mem.replace(mut e.l, Lists {})
+    l.cmds.clear()
+    l.bytes.clear()
+    return l
+}
+
+/// Draw into `p.target` (and `p.depth`): `body` records the draws.
+pub fn Encoder.render(mut self, p: Pass, body: fn(mut Render)) {
+    self.l.cmds.push(Cmd.Begin(p))
+    var r = Render { l: mem.replace(mut self.l, Lists {}), width: p.target.width, height: p.target.height }
+    body(mut r)
+    self.l = mem.replace(mut r.l, Lists {})
+    self.l.cmds.push(Cmd.End)
+}
+
+/// Declare that the next `compute` scope writes `t` with imageStore.
+pub fn Encoder.storage(mut self, t: res.Texture) {
+    self.l.cmds.push(Cmd.Storage(t))
+}
+
+/// Dispatch compute work. Its buffer writes and `storage` textures are
+/// visible to everything recorded after the scope.
+pub fn Encoder.compute(mut self, body: fn(mut Compute)) {
+    self.l.cmds.push(Cmd.BeginCompute)
+    var c = Compute { l: mem.replace(mut self.l, Lists {}) }
+    body(mut c)
+    self.l = mem.replace(mut c.l, Lists {})
+    self.l.cmds.push(Cmd.EndCompute)
+}
+
+/// Take imported `t` from its producer: shaders may sample it after this,
+/// until `release` (both in this encoder).
+pub fn Encoder.acquire(mut self, t: res.Texture) {
+    if t.ext {
+        self.l.cmds.push(Cmd.Acquire(t))
+    }
+}
+
+/// Hand imported `t` back to its producer after the commands sampling it.
+pub fn Encoder.release(mut self, t: res.Texture) {
+    if t.ext {
+        self.l.cmds.push(Cmd.Release(t))
+    }
+}
+
+fn Encoder.push_cmd(mut self, take c: Cmd) {
+    self.l.cmds.push(c)
+}
+
+fn push(mut l: Lists, data: &[u8]) {
+    let at = u32(l.bytes.len())
+    for b in data {
+        l.bytes.push(b)
+    }
+    l.cmds.push(Cmd.Push(at, u32(data.len())))
+}
+
+/// Draw commands inside `Encoder.render`.
+pub struct Render {
+    l: Lists
+    width: u32
+    height: u32
+}
+
+pub fn Render.width(self) -> u32 {
+    return self.width
+}
+
+pub fn Render.height(self) -> u32 {
+    return self.height
+}
+
+/// A pipeline built for this pass's formats.
+pub fn Render.bind(mut self, p: res.Pipeline) {
+    self.l.cmds.push(Cmd.Bind(p))
+}
+
+/// Up to 128 bytes of push constants (`bytes_of(x)`), read by every stage.
+pub fn Render.push(mut self, data: &[u8]) {
+    push(mut self.l, data)
+}
+
+pub fn Render.draw(mut self, vertices: u32, instances: u32) {
+    self.l.cmds.push(Cmd.Draw(vertices, instances))
+}
+
+/// Draw `count` u32 indices from `indices`.
+pub fn Render.draw_indexed(mut self, indices: res.Buffer, count: u32, instances: u32) {
+    self.l.cmds.push(Cmd.DrawIndexed(indices, count, instances))
+}
+
+/// `count` VkDrawIndirectCommand records at `offset` in `args`.
+pub fn Render.draw_indirect(mut self, args: res.Buffer, offset: u64, count: u32) {
+    self.l.cmds.push(Cmd.DrawIndirect(args, offset, count))
+}
+
+/// Restrict drawing to a rectangle inside the target.
+pub fn Render.scissor(mut self, x: i32, y: i32, w: u32, h: u32) {
+    self.l.cmds.push(Cmd.Scissor(x, y, w, h))
+}
+
+/// Dispatch commands inside `Encoder.compute`.
+pub struct Compute {
+    l: Lists
+}
+
+pub fn Compute.bind(mut self, p: res.Pipeline) {
+    self.l.cmds.push(Cmd.Bind(p))
+}
+
+pub fn Compute.push(mut self, data: &[u8]) {
+    push(mut self.l, data)
+}
+
+pub fn Compute.dispatch(mut self, x: u32, y: u32, z: u32) {
+    self.l.cmds.push(Cmd.Dispatch(x, y, z))
+}
+
+/// A VkDispatchIndirectCommand at `offset` in `args`.
+pub fn Compute.dispatch_indirect(mut self, args: res.Buffer, offset: u64) {
+    self.l.cmds.push(Cmd.DispatchIndirect(args, offset))
+}
+
+/// Make earlier dispatches' writes visible to later ones in this scope.
+pub fn Compute.barrier(mut self) {
+    self.l.cmds.push(Cmd.ComputeBarrier)
+}

@@ -1,0 +1,171 @@
+// vk_draw2d: rectangles, rounded rectangles, borders, soft shadows and images,
+// batched into one instance list and drawn with one instanced draw per
+// target. Every shape is a rounded box evaluated as a distance field, so
+// corners, rings and shadows cost what a plain quad costs. Instances go
+// through the upload ring and are read by buffer address; textures by
+// bindless index. Colors are straight alpha in the target's space (use
+// `srgb` for sRGB targets); textures are premultiplied.
+
+import vk_gpu as gpu
+pub import rect
+
+pub type Rect = rect.Rect
+
+/// One instance, laid out as `Quad` in shaders/quad.glsl (std430).
+struct Quad derive(Bytes) {
+    rect: vec4
+    uv: vec4
+    color: vec4
+    clip: vec4
+    radius: f32
+    border: f32
+    soft: f32
+    tex: u32
+}
+
+struct Push derive(Bytes) {
+    addr: u64
+    size: vec2
+}
+
+let no_texture: u32 = 0xFFFFFFFF
+
+pub struct Canvas {
+    pipe: gpu.Pipeline
+    quads: List[Quad] = []
+    /// Scratch: the quads that reach the damage.
+    visible: List[Quad] = []
+    clips: List[Rect] = []
+}
+
+/// A canvas drawing into targets of `format`.
+pub fn Canvas.create(mut dev: gpu.Device, format: gpu.Format) -> Result[Canvas, str] {
+    let d = gpu.Graphics { color: format, blend: gpu.Blend.Alpha }
+    let pipe = try dev.graphics(d, embed("../shaders/quad.vert.spv"), embed("../shaders/quad.frag.spv"))
+    return Ok(Canvas { pipe })
+}
+
+pub fn Canvas.destroy(self, mut dev: gpu.Device) {
+    dev.destroy_pipeline(self.pipe)
+}
+
+/// Forget the shapes of the last frame (keeps the memory).
+pub fn Canvas.clear(mut self) {
+    self.quads.clear()
+    self.clips.clear()
+}
+
+pub fn Canvas.len(self) -> int {
+    return self.quads.len()
+}
+
+fn Canvas.add(mut self, r: Rect, color: vec4, radius: f32, border: f32, soft: f32, tex: u32, uv: vec4) {
+    var clip = vec4(-1.0e9, -1.0e9, 1.0e9, 1.0e9)
+    if let Some(c) = self.clips.last() {
+        clip = vec4(c.x, c.y, c.x + c.w, c.y + c.h)
+    }
+    self.quads.push(Quad { rect: vec4(r.x, r.y, r.w, r.h), uv, color, clip, radius, border, soft, tex })
+}
+
+fn whole() -> vec4 {
+    return vec4(0.0, 0.0, 1.0, 1.0)
+}
+
+pub fn Canvas.rect(mut self, r: Rect, color: vec4) {
+    self.add(r, color, 0.0, 0.0, 0.0, no_texture, whole())
+}
+
+pub fn Canvas.round_rect(mut self, r: Rect, color: vec4, radius: f32) {
+    self.add(r, color, radius, 0.0, 0.0, no_texture, whole())
+}
+
+/// A `width`-pixel ring inside `r`.
+pub fn Canvas.border(mut self, r: Rect, color: vec4, radius: f32, width: f32) {
+    self.add(r, color, radius, width, 0.0, no_texture, whole())
+}
+
+/// A shadow of shape `r` blurred over `blur` pixels (it spreads that far
+/// outside `r`); draw it before the shape.
+pub fn Canvas.shadow(mut self, r: Rect, color: vec4, radius: f32, blur: f32) {
+    self.add(r.grow(blur), color, radius, 0.0, max(blur, 0.0), no_texture, whole())
+}
+
+/// Texture `t` stretched over `r`, with rounded corners.
+pub fn Canvas.image(mut self, t: gpu.Texture, r: Rect, opacity: f32, radius: f32) {
+    self.add(r, vec4(1.0, 1.0, 1.0, opacity), radius, 0.0, 0.0, t.index(), whole())
+}
+
+/// Part `uv` (0..1) of texture `t` over `r`, multiplied by `tint`: atlas
+/// sprites and glyphs.
+pub fn Canvas.image_part(mut self, t: gpu.Texture, r: Rect, uv: Rect, tint: vec4) {
+    self.add(r, tint, 0.0, 0.0, 0.0, t.index(), vec4(uv.x, uv.y, uv.x + uv.w, uv.y + uv.h))
+}
+
+/// Clip later shapes to `r` (within the current clip) until `pop_clip`.
+pub fn Canvas.push_clip(mut self, r: Rect) {
+    var c = r
+    if let Some(top) = self.clips.last() {
+        c = top.intersect(r)
+    }
+    self.clips.push(c)
+}
+
+pub fn Canvas.pop_clip(mut self) {
+    discard self.clips.pop()
+}
+
+/// Record the shapes into pass `p`. With `damage`, only that region is
+/// drawn (scissored, and shapes outside it are skipped): pass `Load.Keep`
+/// and redraw everything under the damage.
+pub fn Canvas.draw(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, p: gpu.Pass, damage: Option[Rect]) -> Result[(), str] {
+    let w = p.target.width()
+    let h = p.target.height()
+    let screen = Rect { w: f32(w), h: f32(h) }
+    let area = match damage {
+        Some(d) => d.intersect(screen)
+        None => screen
+    }
+    self.visible.clear()
+    for i in 0..self.quads.len() {
+        let q = self.quads[i]
+        let b = Rect { x: q.rect.x, y: q.rect.y, w: q.rect.z, h: q.rect.w }
+        let c = Rect { x: q.clip.x, y: q.clip.y, w: q.clip.z - q.clip.x, h: q.clip.w - q.clip.y }
+        if b.intersect(c).overlaps(area) {
+            self.visible.push(q)
+        }
+    }
+    let n = u32(self.visible.len())
+    guard n > 0 or p.load != gpu.Load.Keep else {
+        return Ok(())
+    }
+    var addr: u64 = 0
+    if n > 0 {
+        addr = (try dev.stage(bytes_of(self.visible))).addr()
+    }
+    let push = Push { addr, size: vec2(f32(w), f32(h)) }
+    let pipe = self.pipe
+    let x0 = area.x.floor()
+    let y0 = area.y.floor()
+    let x1 = (area.x + area.w).ceil()
+    let y1 = (area.y + area.h).ceil()
+    e.render(p, fn(mut r) {
+        if damage.is_some() {
+            r.scissor(i32(x0), i32(y0), u32(x1 - x0), u32(y1 - y0))
+        }
+        if n > 0 {
+            r.bind(pipe)
+            r.push(bytes_of(push))
+            r.draw(6, n)
+        }
+    })
+    return Ok(())
+}
+
+fn linear(c: f32) -> f32 {
+    return if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).pow(2.4) }
+}
+
+/// A color written in sRGB (as designers give it), converted for an sRGB target.
+pub fn srgb(r: f32, g: f32, b: f32, a: f32) -> vec4 {
+    return vec4(linear(r), linear(g), linear(b), a)
+}

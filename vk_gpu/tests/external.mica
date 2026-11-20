@@ -1,0 +1,61 @@
+// Sharing on the real device: a texture exported as a dmabuf, drawn into,
+// fenced with a sync_file, then imported as another texture and sampled.
+// Skipped when the driver lacks the dmabuf or sync_file extensions.
+
+import std.io
+import vk_gpu as gpu
+
+test "dmabuf and sync_file round trip" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return
+    }
+    var dev = d
+    let exported = dev.export_dmabuf(gpu.TextureDesc { width: 4, height: 4 })
+    guard let Ok((a, buf)) = exported else {
+        io.eprint("skipped: {exported.unwrap_err()}")
+        return
+    }
+    assert(buf.fd >= 0)
+    assert(buf.stride >= 16)
+    var e = dev.encoder().unwrap()
+    e.render(gpu.Pass { target: a, clear: [0.0, 1.0, 0.0, 1.0] }, fn(mut r) {})
+    let (t, fence) = dev.submit_sync_file(take e).unwrap()
+
+    let b = dev.import_dmabuf(buf).unwrap()
+    assert(b.imported())
+    dev.wait_sync_file(fence).unwrap()
+    let dst = dev.texture(gpu.TextureDesc { width: 4, height: 4, target: true }).unwrap()
+    let p = dev.graphics(gpu.Graphics { color: gpu.Format.R8G8B8A8_UNORM }, embed("shaders/fullscreen.vert.spv"), embed("shaders/sample.frag.spv")).unwrap()
+    var e2 = dev.encoder().unwrap()
+    e2.acquire(b)
+    let index = b.index()
+    e2.render(gpu.Pass { target: dst }, fn(mut r) {
+        r.bind(p)
+        r.push(bytes_of(index))
+        r.draw(3, 1)
+    })
+    e2.release(b)
+    dev.wait(dev.submit(take e2).unwrap()).unwrap()
+    assert(dev.done(t))
+    let px = dev.read_texture(dst).unwrap()
+    for i in 0..16 {
+        assert_eq((px[i * 4], px[i * 4 + 1], px[i * 4 + 2], px[i * 4 + 3]), (u8(0), u8(255), u8(0), u8(255)))
+    }
+}
+
+test "offscreen frames report their age" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true }) else {
+        return
+    }
+    var dev = d
+    var out = gpu.Offscreen.create(mut dev, 2, 2, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    for want in [u32(0), u32(1), u32(1)] {
+        let f = out.acquire(mut dev).unwrap().unwrap()
+        assert_eq(f.age(), want)
+        var e = dev.encoder().unwrap()
+        e.render(gpu.Pass { target: f.image() }, fn(mut r) {})
+        discard out.present(mut dev, f, take e).unwrap()
+    }
+    out.resize(3, 3)
+    assert_eq(out.acquire(mut dev).unwrap().unwrap().age(), u32(0))
+}

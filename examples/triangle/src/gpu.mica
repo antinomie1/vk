@@ -1,0 +1,123 @@
+// Instance, XCB surface, a device with a graphics + present queue, and the
+// command tables loaded for them.
+
+import vk
+import xcb
+
+pub struct Gpu {
+    inst: vk.InstanceFnV1_0
+    surf: vk.KhrSurfaceInstanceFn
+    dev: vk.DeviceFnV1_0
+    sc: vk.KhrSwapchainDeviceFn
+    instance: vk.Instance
+    surface: vk.SurfaceKHR
+    pdev: vk.PhysicalDevice
+    device: vk.Device
+    family: u32
+    queue: vk.Queue
+}
+
+/// `Err` naming the call unless `r` is `SUCCESS`.
+pub fn ok(r: vk.VkResult, what: str) -> Result[bool, str] {
+    return r.result().map(fn(u) => true).map_err(fn(e) => "{what}: {e}")
+}
+
+pub fn init(win: xcb.Window) -> Result[Gpu, str] {
+    let st = try vk.StaticFn.open(vk.loader_name)
+    let entry = vk.EntryFnV1_0.load(fn(n) => st.get_instance_proc_addr(vk.Instance {}, n))
+    let app_name = "triangle"
+    let surface_ext = vk.khr_surface_extension_name
+    let xcb_ext = vk.khr_xcb_surface_extension_name
+    unsafe let exts: [2]Ptr[u8] = [surface_ext.as_cstr(), xcb_ext.as_cstr()]
+    unsafe let app = vk.ApplicationInfo { p_application_name: app_name.as_cstr(), api_version: vk.api_version_1_0 }
+    unsafe let info = vk.InstanceCreateInfo {
+        p_application_info: Ptr.of(app),
+        enabled_extension_count: 2,
+        pp_enabled_extension_names: Ptr.of(exts).cast[Ptr[u8]](),
+    }
+    var instance = vk.Instance {}
+    unsafe let r = entry.create_instance(Ptr.of(info), Ptr.null(), mut instance)
+    discard try ok(r, "vkCreateInstance")
+    let inst = vk.InstanceFnV1_0.load(fn(n) => st.get_instance_proc_addr(instance, n))
+    let surf = try vk.KhrSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)).ok_or("VK_KHR_surface is missing")
+    let xs = try vk.KhrXcbSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)).ok_or("VK_KHR_xcb_surface is missing")
+
+    unsafe let sinfo = vk.XcbSurfaceCreateInfoKHR { connection: win.connection(), window: win.id }
+    var surface = vk.SurfaceKHR {}
+    unsafe let rs = xs.create_xcb_surface_khr(instance, Ptr.of(sinfo), Ptr.null(), mut surface)
+    discard try ok(rs, "vkCreateXcbSurfaceKHR")
+
+    let (pdev, family) = try pick(inst, surf, instance, surface)
+    var prio: f32 = 1.0
+    unsafe let queue = vk.DeviceQueueCreateInfo { queue_family_index: family, queue_count: 1, p_queue_priorities: Ptr.of(prio) }
+    let swapchain_ext = vk.khr_swapchain_extension_name
+    unsafe let dexts: [1]Ptr[u8] = [swapchain_ext.as_cstr()]
+    unsafe let dinfo = vk.DeviceCreateInfo {
+        queue_create_info_count: 1,
+        p_queue_create_infos: Ptr.of(queue),
+        enabled_extension_count: 1,
+        pp_enabled_extension_names: Ptr.of(dexts).cast[Ptr[u8]](),
+    }
+    var device = vk.Device {}
+    unsafe let rd = inst.create_device(pdev, Ptr.of(dinfo), Ptr.null(), mut device)
+    discard try ok(rd, "vkCreateDevice")
+    let dev = vk.DeviceFnV1_0.load(fn(n) => inst.get_device_proc_addr(device, n))
+    let sc = try vk.KhrSwapchainDeviceFn.try_load(fn(n) => inst.get_device_proc_addr(device, n)).ok_or("VK_KHR_swapchain is missing")
+    var q = vk.Queue {}
+    dev.get_device_queue(device, family, 0, mut q)
+    return Ok(Gpu { inst, surf, dev, sc, instance, surface, pdev, device, family, queue: q })
+}
+
+/// The first device with a queue family that draws and presents to `surface`.
+fn pick(inst: vk.InstanceFnV1_0, surf: vk.KhrSurfaceInstanceFn, instance: vk.Instance, surface: vk.SurfaceKHR) -> Result[(vk.PhysicalDevice, u32), str] {
+    var count: u32 = 0
+    discard try ok(inst.enumerate_physical_devices(instance, mut count, Ptr.null()), "vkEnumeratePhysicalDevices")
+    var pdevs: List[vk.PhysicalDevice] = []
+    for _ in 0..count {
+        pdevs.push(vk.PhysicalDevice {})
+    }
+    discard try ok(inst.enumerate_physical_devices(instance, mut count, pdevs), "vkEnumeratePhysicalDevices")
+    for pd in pdevs {
+        var n: u32 = 0
+        inst.get_physical_device_queue_family_properties(pd, mut n, Ptr.null())
+        var fams: List[vk.QueueFamilyProperties] = []
+        for _ in 0..n {
+            fams.push(vk.QueueFamilyProperties {})
+        }
+        inst.get_physical_device_queue_family_properties(pd, mut n, fams)
+        for i, f in fams {
+            var present: vk.Bool32 = 0
+            discard surf.get_physical_device_surface_support_khr(pd, u32(i), surface, mut present)
+            if f.queue_flags.contains(vk.QueueFlags.GRAPHICS) and present == vk.r#true {
+                return Ok((pd, u32(i)))
+            }
+        }
+    }
+    return Err("no GPU can draw to this window")
+}
+
+/// A B8G8R8A8 sRGB format if the surface has one, else its first.
+pub fn Gpu.surface_format(self) -> Result[vk.SurfaceFormatKHR, str] {
+    var n: u32 = 0
+    discard try ok(self.surf.get_physical_device_surface_formats_khr(self.pdev, self.surface, mut n, Ptr.null()), "vkGetPhysicalDeviceSurfaceFormatsKHR")
+    var formats: List[vk.SurfaceFormatKHR] = []
+    for _ in 0..n {
+        formats.push(vk.SurfaceFormatKHR {})
+    }
+    discard try ok(self.surf.get_physical_device_surface_formats_khr(self.pdev, self.surface, mut n, formats), "vkGetPhysicalDeviceSurfaceFormatsKHR")
+    guard not formats.is_empty() else {
+        return Err("the surface has no formats")
+    }
+    for f in formats {
+        if f.format == vk.Format.B8G8R8A8_SRGB and f.color_space == vk.ColorSpaceKHR.SRGB_NONLINEAR {
+            return Ok(f)
+        }
+    }
+    return Ok(formats[0])
+}
+
+pub fn Gpu.destroy(self) {
+    self.dev.destroy_device(self.device, Ptr.null())
+    self.surf.destroy_surface_khr(self.instance, self.surface, Ptr.null())
+    self.inst.destroy_instance(self.instance, Ptr.null())
+}

@@ -1,0 +1,187 @@
+// vk_compose: a compositor's frame. Windows are views over textures (shm
+// uploads or imported dmabufs) stacked back to front. The scene turns what
+// changed since the last frame into damage, widens it by the target image's
+// age (older images missed the damage of the frames since), and redraws
+// only that region with vk_draw2d; imported textures are acquired from and
+// released to their clients around the pass.
+
+import vk_gpu as gpu
+import vk_draw2d as draw2d
+
+pub type Rect = draw2d.Rect
+
+pub struct View {
+    pub tex: gpu.Texture
+    pub x: f32 = 0.0
+    pub y: f32 = 0.0
+    /// Size on screen; 0 means the texture's size.
+    pub w: f32 = 0.0
+    pub h: f32 = 0.0
+    pub opacity: f32 = 1.0
+    pub radius: f32 = 0.0
+    /// Drop shadow blur in pixels; 0 for none.
+    pub shadow: f32 = 0.0
+}
+
+/// Where `v` covers the screen, shadow included.
+fn View.rect(self) -> Rect {
+    let w = if self.w > 0.0 { self.w } else { f32(self.tex.width()) }
+    let h = if self.h > 0.0 { self.h } else { f32(self.tex.height()) }
+    return Rect { x: self.x, y: self.y, w, h }
+}
+
+fn View.bounds(self) -> Rect {
+    return self.rect().grow(self.shadow)
+}
+
+struct Entry {
+    id: u32
+    view: View
+}
+
+/// Damage of the last frames, newest first: what an image of age a missed.
+let history_len = 4
+
+pub struct Scene {
+    width: f32
+    height: f32
+    background: vec4
+    entries: List[Entry] = []
+    next: u32 = 1
+    /// Damage since the last `render`.
+    pending: Rect = Rect {}
+    history: List[Rect] = []
+}
+
+pub fn Scene.new(width: u32, height: u32, background: vec4) -> Scene {
+    return Scene { width: f32(width), height: f32(height), background, pending: Rect { w: f32(width), h: f32(height) } }
+}
+
+fn Scene.damage(mut self, r: Rect) {
+    self.pending = self.pending.union(r)
+}
+
+fn Scene.find(self, id: u32) -> int {
+    return self.entries.position(fn(e) => e.id == id).unwrap_or(-1)
+}
+
+/// Put `v` on top; its id names it from now on.
+pub fn Scene.add(mut self, v: View) -> u32 {
+    let id = self.next
+    self.next += 1
+    self.entries.push(Entry { id, view: v })
+    self.damage(v.bounds())
+    return id
+}
+
+/// Move, resize, restyle or give `id` a new buffer.
+pub fn Scene.set(mut self, id: u32, v: View) {
+    let i = self.find(id)
+    guard i >= 0 else {
+        return
+    }
+    self.damage(self.entries[i].view.bounds())
+    self.damage(v.bounds())
+    self.entries[i] = Entry { id, view: v }
+}
+
+pub fn Scene.get(self, id: u32) -> Option[View] {
+    let i = self.find(id)
+    return if i < 0 { None } else { Some(self.entries[i].view) }
+}
+
+/// The client drew into `id`'s buffer: `area` in buffer pixels, or all.
+pub fn Scene.commit(mut self, id: u32, area: Option[Rect]) {
+    let i = self.find(id)
+    guard i >= 0 else {
+        return
+    }
+    let v = self.entries[i].view
+    let r = v.rect()
+    guard let Some(a) = area else {
+        self.damage(r)
+        return
+    }
+    let sx = r.w / f32(v.tex.width())
+    let sy = r.h / f32(v.tex.height())
+    self.damage(Rect { x: r.x + a.x * sx, y: r.y + a.y * sy, w: a.w * sx, h: a.h * sy }.grow(1.0))
+}
+
+pub fn Scene.remove(mut self, id: u32) {
+    let i = self.find(id)
+    guard i >= 0 else {
+        return
+    }
+    self.damage(self.entries[i].view.bounds())
+    discard self.entries.remove(i)
+}
+
+/// Move `id` to the top.
+pub fn Scene.raise(mut self, id: u32) {
+    let i = self.find(id)
+    guard i >= 0 else {
+        return
+    }
+    let e = self.entries.remove(i)
+    self.damage(e.view.bounds())
+    self.entries.push(e)
+}
+
+pub fn Scene.resize(mut self, width: u32, height: u32) {
+    self.width = f32(width)
+    self.height = f32(height)
+    self.damage_all()
+}
+
+pub fn Scene.damage_all(mut self) {
+    self.damage(Rect { w: self.width, h: self.height })
+}
+
+/// Nothing changed since the last frame: no need to draw or present.
+pub fn Scene.idle(self) -> bool {
+    return self.pending.is_empty()
+}
+
+/// Redraw what frame `f` needs into it, recording into `e`; false when
+/// its image is already up to date. Present `e` either way.
+pub fn Scene.render(mut self, mut dev: gpu.Device, mut c: draw2d.Canvas, mut e: gpu.Encoder, f: gpu.Frame) -> Result[bool, str] {
+    let screen = Rect { w: self.width, h: self.height }
+    let now = self.pending.intersect(screen)
+    self.pending = Rect {}
+    var area = now
+    let age = int(f.age())
+    if age == 0 or age > self.history.len() + 1 {
+        area = screen
+    } else {
+        for i in 0..age - 1 {
+            area = area.union(self.history[i])
+        }
+    }
+    self.history.insert(0, now)
+    self.history.truncate(history_len)
+    area = area.intersect(screen)
+    guard not area.is_empty() else {
+        return Ok(false)
+    }
+
+    c.clear()
+    c.rect(screen, self.background)
+    for en in self.entries {
+        let v = en.view
+        guard v.bounds().overlaps(area) else {
+            continue
+        }
+        if v.shadow > 0.0 {
+            c.shadow(v.rect(), vec4(0.0, 0.0, 0.0, 0.45 * v.opacity), v.radius, v.shadow)
+        }
+        c.image(v.tex, v.rect(), v.opacity, v.radius)
+        e.acquire(v.tex)
+    }
+    try c.draw(mut dev, mut e, gpu.Pass { target: f.image(), load: gpu.Load.Keep }, Some(area))
+    for en in self.entries {
+        if en.view.bounds().overlaps(area) {
+            e.release(en.view.tex)
+        }
+    }
+    return Ok(true)
+}

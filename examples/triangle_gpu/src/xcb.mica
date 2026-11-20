@@ -1,0 +1,160 @@
+// A minimal XCB window (X11 or XWayland): what a Vulkan surface and a
+// close button need, declared by hand from <xcb/xcb.h>.
+
+struct Cookie {
+    sequence: u32
+}
+
+struct Screen {
+    root: u32
+    default_colormap: u32
+    white_pixel: u32
+    black_pixel: u32
+    current_input_masks: u32
+    width_in_pixels: u16
+    height_in_pixels: u16
+    width_in_millimeters: u16
+    height_in_millimeters: u16
+    min_installed_maps: u16
+    max_installed_maps: u16
+    root_visual: u32
+    backing_stores: u8
+    save_unders: u8
+    root_depth: u8
+    allowed_depths_len: u8
+}
+
+unsafe struct ScreenIter {
+    data: Ptr[Screen]
+    rem: i32
+    index: i32
+}
+
+struct AtomReply {
+    response_type: u8
+    pad0: u8
+    sequence: u16
+    length: u32
+    atom: u32
+}
+
+/// The first 16 bytes of an event; `data0` is a client message's first word.
+struct Event {
+    response_type: u8
+    detail: u8
+    sequence: u16
+    window: u32
+    kind: u32
+    data0: u32
+}
+
+extern fn xcb_connect(display: Ptr[u8], mut screen: i32) -> Ptr[u8]
+extern fn xcb_connection_has_error(c: Ptr[u8]) -> i32
+extern fn xcb_get_setup(c: Ptr[u8]) -> Ptr[u8]
+extern fn xcb_setup_roots_iterator(setup: Ptr[u8]) -> ScreenIter
+extern fn xcb_screen_next(mut it: ScreenIter)
+extern fn xcb_generate_id(c: Ptr[u8]) -> u32
+extern fn xcb_create_window(c: Ptr[u8], depth: u8, wid: u32, parent: u32, x: i16, y: i16, w: u16, h: u16, border: u16, class: u16, visual: u32, mask: u32, values: Ptr[u32]) -> Cookie
+extern fn xcb_map_window(c: Ptr[u8], w: u32) -> Cookie
+extern fn xcb_destroy_window(c: Ptr[u8], w: u32) -> Cookie
+extern fn xcb_change_property(c: Ptr[u8], mode: u8, w: u32, property: u32, ty: u32, format: u8, len: u32, data: Ptr[u8]) -> Cookie
+extern fn xcb_intern_atom(c: Ptr[u8], only_if_exists: u8, len: u16, name: str) -> Cookie
+extern fn xcb_intern_atom_reply(c: Ptr[u8], cookie: Cookie, err: Ptr[u8]) -> Ptr[AtomReply]
+extern fn xcb_poll_for_event(c: Ptr[u8]) -> Ptr[Event]
+extern fn xcb_flush(c: Ptr[u8]) -> i32
+extern fn xcb_disconnect(c: Ptr[u8])
+extern fn free(p: Ptr[u8])
+
+// <xcb/xproto.h> values
+let cw_back_pixel: u32 = 2
+let cw_event_mask: u32 = 2048
+let event_mask_key_press: u32 = 1
+let event_mask_structure_notify: u32 = 131072
+let atom_atom: u32 = 4
+let atom_string: u32 = 31
+let atom_wm_name: u32 = 39
+let key_press: u8 = 2
+let client_message: u8 = 33
+let keycode_escape: u8 = 9
+
+pub unsafe struct Window {
+    conn: Ptr[u8]
+    pub id: u32
+    pub width: u32
+    pub height: u32
+    delete: u32
+}
+
+/// Open and map a `width` x `height` window titled `title`.
+pub fn open(title: str, width: u16, height: u16) -> Result[Window, str] {
+    var screen_no: i32 = 0
+    let conn = xcb_connect(Ptr.null(), mut screen_no)
+    guard xcb_connection_has_error(conn) == 0 else {
+        xcb_disconnect(conn)
+        return Err("cannot connect to the X server (is DISPLAY set?)")
+    }
+    var it = xcb_setup_roots_iterator(xcb_get_setup(conn))
+    for _ in 0..screen_no {
+        xcb_screen_next(mut it)
+    }
+    unsafe let screen = it.data.read()
+    var win = Window { conn, id: xcb_generate_id(conn), width: u32(width), height: u32(height), delete: 0 }
+    let values: [2]u32 = [screen.black_pixel, event_mask_key_press | event_mask_structure_notify]
+    unsafe let vp = Ptr.of(values).cast[u32]()
+    discard xcb_create_window(conn, 0, win.id, screen.root, 0, 0, width, height, 0, 1, screen.root_visual, cw_back_pixel | cw_event_mask, vp)
+    discard xcb_change_property(conn, 0, win.id, atom_wm_name, atom_string, 8, u32(title.len()), title)
+    // Ask the window manager for a close message instead of a killed connection.
+    let protocols = win.atom("WM_PROTOCOLS")
+    win.delete = win.atom("WM_DELETE_WINDOW")
+    unsafe let dp = Ptr.of(win.delete).cast[u8]()
+    discard xcb_change_property(conn, 0, win.id, protocols, atom_atom, 32, 1, dp)
+    discard xcb_map_window(conn, win.id)
+    discard xcb_flush(conn)
+    return Ok(win)
+}
+
+fn Window.atom(self, name: str) -> u32 {
+    let reply = xcb_intern_atom_reply(self.conn, xcb_intern_atom(self.conn, 0, u16(name.len()), name), Ptr.null())
+    guard not reply.is_null() else {
+        return 0
+    }
+    var atom: u32 = 0
+    unsafe {
+        atom = reply.read().atom
+        free(reply.cast[u8]())
+    }
+    return atom
+}
+
+/// Handle pending events; false once the window is closed or Escape is
+/// pressed.
+pub fn Window.poll(mut self) -> bool {
+    var open = xcb_connection_has_error(self.conn) == 0
+    while open {
+        let ev = xcb_poll_for_event(self.conn)
+        if ev.is_null() {
+            break
+        }
+        unsafe {
+            let e = ev.read()
+            let kind = e.response_type & 0x7F
+            if kind == client_message and e.data0 == self.delete {
+                open = false
+            } else if kind == key_press and e.detail == keycode_escape {
+                open = false
+            }
+            free(ev.cast[u8]())
+        }
+    }
+    return open
+}
+
+/// The X server connection, for `VkXcbSurfaceCreateInfoKHR`.
+pub unsafe fn Window.connection(self) -> Ptr[u8] {
+    return self.conn
+}
+
+fn Window.drop(mut self) {
+    discard xcb_destroy_window(self.conn, self.id)
+    xcb_disconnect(self.conn)
+}

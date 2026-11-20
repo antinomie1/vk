@@ -1,0 +1,218 @@
+// Sharing with other processes (Wayland clients, KMS, video decoders):
+// textures as single-plane dmabufs, GPU work as sync_file fences.
+// Imported textures belong to their producer's queue between submits:
+// `Encoder.acquire` / `release` pass ownership in and out around sampling.
+
+import vk
+import ctx
+import res
+import alloc
+import boot
+import sync
+
+/// One plane of a dmabuf, as linux-dmabuf or KMS describe it.
+pub struct Dmabuf {
+    pub fd: i32
+    pub width: u32
+    pub height: u32
+    pub format: vk.Format
+    /// DRM format modifier; 0 is linear.
+    pub modifier: u64 = 0
+    pub offset: u64 = 0
+    pub stride: u64
+}
+
+fn dma_buf() -> vk.ExternalMemoryHandleTypeFlags {
+    return vk.ExternalMemoryHandleTypeFlags.DMA_BUF_EXT
+}
+
+fn require(e: boot.External) -> Result[(vk.KhrExternalMemoryFdDeviceFn, vk.ExtImageDrmFormatModifierDeviceFn), str] {
+    guard let Some(fd) = e.mem_fd else {
+        return Err("VK_KHR_external_memory_fd is missing")
+    }
+    guard let Some(drm) = e.drm else {
+        return Err("VK_EXT_image_drm_format_modifier is missing")
+    }
+    guard e.dmabuf else {
+        return Err("VK_EXT_external_memory_dma_buf is missing")
+    }
+    return Ok((fd, drm))
+}
+
+/// A dedicated allocation of type `t` for `image`, importing `fd` when it
+/// is not -1, else exportable as a dmabuf.
+fn dedicated(cx: ctx.Ctx, image: vk.Image, size: u64, t: u32, fd: i32) -> Result[vk.DeviceMemory, str] {
+    let only = vk.MemoryDedicatedAllocateInfo { image }
+    unsafe let imp = vk.ImportMemoryFdInfoKHR { p_next: Ptr.of(only).cast[u8](), handle_type: dma_buf(), fd }
+    unsafe let exp = vk.ExportMemoryAllocateInfo { p_next: Ptr.of(only).cast[u8](), handle_types: dma_buf() }
+    unsafe let next = if fd >= 0 { Ptr.of(imp).cast[u8]() } else { Ptr.of(exp).cast[u8]() }
+    let info = vk.MemoryAllocateInfo { p_next: next, allocation_size: size, memory_type_index: t }
+    var memory = vk.DeviceMemory {}
+    unsafe try ctx.ok(cx.fns.allocate_memory(cx.device, Ptr.of(info), Ptr.null(), mut memory), "vkAllocateMemory (dmabuf)")
+    return Ok(memory)
+}
+
+/// The device-local type among `bits`, else the first.
+fn memory_type(mem: alloc.Allocator, bits: u32) -> Result[u32, str] {
+    let t = mem.pick(bits, alloc.Mem.Gpu)
+    if t >= 0 {
+        return Ok(u32(t))
+    }
+    for i in 0..32 {
+        if (bits >> u32(i)) & 1 == 1 {
+            return Ok(u32(i))
+        }
+    }
+    return Err("no memory type can hold this dmabuf")
+}
+
+fn info(d: Dmabuf) -> res.TextureDesc {
+    return res.TextureDesc { width: d.width, height: d.height, format: d.format }
+}
+
+fn import_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: Dmabuf) -> Result[res.TexInfo, str] {
+    let (fdfns, drm) = try require(e)
+    let plane = vk.SubresourceLayout { offset: d.offset, row_pitch: d.stride }
+    unsafe let explicit = vk.ImageDrmFormatModifierExplicitCreateInfoEXT { drm_format_modifier: d.modifier, drm_format_modifier_plane_count: 1, p_plane_layouts: Ptr.of(plane) }
+    unsafe let external = vk.ExternalMemoryImageCreateInfo { p_next: Ptr.of(explicit).cast[u8](), handle_types: dma_buf() }
+    unsafe let ci = vk.ImageCreateInfo {
+        p_next: Ptr.of(external).cast[u8](),
+        image_type: vk.ImageType.TYPE_2D,
+        format: d.format,
+        extent: vk.Extent3D { width: d.width, height: d.height, depth: 1 },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: vk.SampleCountFlags.TYPE_1,
+        tiling: vk.ImageTiling.DRM_FORMAT_MODIFIER_EXT,
+        usage: vk.ImageUsageFlags.SAMPLED | vk.ImageUsageFlags.TRANSFER_SRC,
+        sharing_mode: vk.SharingMode.EXCLUSIVE,
+        initial_layout: vk.ImageLayout.UNDEFINED,
+    }
+    var image = vk.Image {}
+    unsafe try ctx.ok(cx.fns.create_image(cx.device, Ptr.of(ci), Ptr.null(), mut image), "vkCreateImage (dmabuf)")
+    var failed = true
+    defer {
+        if failed {
+            cx.fns.destroy_image(cx.device, image, Ptr.null())
+        }
+    }
+    var fdp = vk.MemoryFdPropertiesKHR {}
+    try ctx.ok(fdfns.get_memory_fd_properties_khr(cx.device, dma_buf(), d.fd, mut fdp), "vkGetMemoryFdPropertiesKHR")
+    var req = vk.MemoryRequirements {}
+    cx.fns.get_image_memory_requirements(cx.device, image, mut req)
+    let t = try memory_type(mem, req.memory_type_bits & fdp.memory_type_bits)
+    let memory = try dedicated(cx, image, req.size, t, d.fd)
+    try ctx.ok(cx.fns.bind_image_memory(cx.device, image, memory, 0), "vkBindImageMemory")
+    let view = try res.view(cx, image, d.format)
+    failed = false
+    let a = alloc.Alloc { memory, offset: 0, size: req.size, addr: 0, pool: -1, block: -1 }
+    return Ok(res.TexInfo {
+        image,
+        view,
+        mem: a,
+        state: sync.Use.Sampled,
+        owned: true,
+        format: d.format,
+        width: d.width,
+        height: d.height,
+        aspect: res.aspect(d.format),
+        ext: true,
+        copy: false,
+    })
+}
+
+/// A linear, exportable render target and its dmabuf (the fd is the caller's).
+fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.TextureDesc) -> Result[(res.TexInfo, Dmabuf), str] {
+    let (fdfns, drm) = try require(e)
+    let linear: u64 = 0
+    unsafe let list = vk.ImageDrmFormatModifierListCreateInfoEXT { drm_format_modifier_count: 1, p_drm_format_modifiers: Ptr.of(linear) }
+    unsafe let external = vk.ExternalMemoryImageCreateInfo { p_next: Ptr.of(list).cast[u8](), handle_types: dma_buf() }
+    unsafe let ci = vk.ImageCreateInfo {
+        p_next: Ptr.of(external).cast[u8](),
+        image_type: vk.ImageType.TYPE_2D,
+        format: d.format,
+        extent: vk.Extent3D { width: d.width, height: d.height, depth: 1 },
+        mip_levels: 1,
+        array_layers: 1,
+        samples: vk.SampleCountFlags.TYPE_1,
+        tiling: vk.ImageTiling.DRM_FORMAT_MODIFIER_EXT,
+        usage: vk.ImageUsageFlags.SAMPLED | vk.ImageUsageFlags.COLOR_ATTACHMENT | vk.ImageUsageFlags.TRANSFER_SRC | vk.ImageUsageFlags.TRANSFER_DST,
+        sharing_mode: vk.SharingMode.EXCLUSIVE,
+        initial_layout: vk.ImageLayout.UNDEFINED,
+    }
+    var image = vk.Image {}
+    unsafe try ctx.ok(cx.fns.create_image(cx.device, Ptr.of(ci), Ptr.null(), mut image), "vkCreateImage (exportable)")
+    var failed = true
+    defer {
+        if failed {
+            cx.fns.destroy_image(cx.device, image, Ptr.null())
+        }
+    }
+    var req = vk.MemoryRequirements {}
+    cx.fns.get_image_memory_requirements(cx.device, image, mut req)
+    let memory = try dedicated(cx, image, req.size, try memory_type(mem, req.memory_type_bits), -1)
+    try ctx.ok(cx.fns.bind_image_memory(cx.device, image, memory, 0), "vkBindImageMemory")
+    let gi = vk.MemoryGetFdInfoKHR { memory, handle_type: dma_buf() }
+    var fd: i32 = -1
+    unsafe try ctx.ok(fdfns.get_memory_fd_khr(cx.device, Ptr.of(gi), mut fd), "vkGetMemoryFdKHR")
+    let sub = vk.ImageSubresource { aspect_mask: vk.ImageAspectFlags.MEMORY_PLANE_0_EXT }
+    var layout = vk.SubresourceLayout {}
+    unsafe cx.fns.get_image_subresource_layout(cx.device, image, Ptr.of(sub), mut layout)
+    var props = vk.ImageDrmFormatModifierPropertiesEXT {}
+    try ctx.ok(drm.get_image_drm_format_modifier_properties_ext(cx.device, image, mut props), "vkGetImageDrmFormatModifierPropertiesEXT")
+    let view = try res.view(cx, image, d.format)
+    failed = false
+    let a = alloc.Alloc { memory, offset: 0, size: req.size, addr: 0, pool: -1, block: -1 }
+    let buf = Dmabuf { fd, width: d.width, height: d.height, format: d.format, modifier: props.drm_format_modifier, offset: layout.offset, stride: layout.row_pitch }
+    let ti = res.TexInfo {
+        image,
+        view,
+        mem: a,
+        state: sync.Use.Undefined,
+        owned: true,
+        format: d.format,
+        width: d.width,
+        height: d.height,
+        aspect: res.aspect(d.format),
+        target: true,
+    }
+    return Ok((ti, buf))
+}
+
+/// A binary semaphore that can import and export sync_files.
+fn binary(cx: ctx.Ctx) -> Result[vk.Semaphore, str] {
+    let exp = vk.ExportSemaphoreCreateInfo { handle_types: vk.ExternalSemaphoreHandleTypeFlags.SYNC_FD }
+    unsafe let info = vk.SemaphoreCreateInfo { p_next: Ptr.of(exp).cast[u8]() }
+    var sem = vk.Semaphore {}
+    unsafe try ctx.ok(cx.fns.create_semaphore(cx.device, Ptr.of(info), Ptr.null(), mut sem), "vkCreateSemaphore")
+    return Ok(sem)
+}
+
+fn sem_fns(e: boot.External) -> Result[vk.KhrExternalSemaphoreFdDeviceFn, str] {
+    guard let Some(f) = e.sem_fd else {
+        return Err("VK_KHR_external_semaphore_fd is missing")
+    }
+    return Ok(f)
+}
+
+/// Make `sem` wait for sync_file `fd` (taking it) until its next wait.
+fn import_fence(cx: ctx.Ctx, e: boot.External, sem: vk.Semaphore, fd: i32) -> Result[(), str] {
+    let f = try sem_fns(e)
+    let info = vk.ImportSemaphoreFdInfoKHR {
+        semaphore: sem,
+        flags: vk.SemaphoreImportFlags.TEMPORARY,
+        handle_type: vk.ExternalSemaphoreHandleTypeFlags.SYNC_FD,
+        fd,
+    }
+    unsafe try ctx.ok(f.import_semaphore_fd_khr(cx.device, Ptr.of(info)), "vkImportSemaphoreFdKHR")
+    return Ok(())
+}
+
+/// A sync_file for the pending signal of `sem`.
+fn export_fence(cx: ctx.Ctx, e: boot.External, sem: vk.Semaphore) -> Result[i32, str] {
+    let f = try sem_fns(e)
+    let info = vk.SemaphoreGetFdInfoKHR { semaphore: sem, handle_type: vk.ExternalSemaphoreHandleTypeFlags.SYNC_FD }
+    var fd: i32 = -1
+    unsafe try ctx.ok(f.get_semaphore_fd_khr(cx.device, Ptr.of(info), mut fd), "vkGetSemaphoreFdKHR")
+    return Ok(fd)
+}

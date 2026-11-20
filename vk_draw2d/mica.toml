@@ -1,0 +1,8 @@
+[package]
+name = "vk_draw2d"
+version = "0.1.0"
+description = "Batched 2D drawing on vk_gpu: rounded rects, borders, shadows, images, clips, damage"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+vk_gpu = { path = "../vk_gpu" }

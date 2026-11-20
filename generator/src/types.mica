@@ -1,0 +1,179 @@
+// C types -> Mica types: kinds, field and parameter types, defaults.
+
+import registry
+import names
+
+/// Mica type of a C type name, without pointers or arrays.
+pub fn base(ty: str) -> str {
+    return match ty {
+        "void" or "char" or "uint8_t" => "u8"
+        "int" or "int32_t" => "i32"
+        "float" => "f32"
+        "double" => "f64"
+        "size_t" => "usize"
+        "int8_t" => "i8"
+        "uint16_t" => "u16"
+        "int16_t" => "i16"
+        "uint32_t" => "u32"
+        "uint64_t" => "u64"
+        "int64_t" => "i64"
+        _ => names.type_name(ty)
+    }
+}
+
+/// Platform types from window-system and OS headers; "" if unknown.
+/// `u8` marks an opaque type only used behind a pointer.
+pub fn external(name: str) -> str {
+    return match name {
+        "Display" or "wl_display" or "wl_surface" or "ubm_device" or "ubm_surface" or "xcb_connection_t" => "u8"
+        "IDirectFB" or "IDirectFBSurface" or "_screen_context" or "_screen_window" or "_screen_buffer" => "u8"
+        "SECURITY_ATTRIBUTES" or "NvSciSyncFence" => "u8"
+        "VisualID" or "Window" or "RROutput" => "usize"
+        "xcb_visualid_t" or "xcb_window_t" or "zx_handle_t" or "GgpStreamDescriptor" or "DWORD" => "u32"
+        "GgpFrameToken" => "u64"
+        "HINSTANCE" or "HWND" or "HMONITOR" or "HANDLE" => "Ptr[u8]"
+        "NvSciSyncAttrList" or "NvSciSyncObj" or "NvSciBufAttrList" or "NvSciBufObj" => "Ptr[u8]"
+        "LPCWSTR" => "Ptr[u16]"
+        _ => ""
+    }
+}
+
+/// Target of a `basetype`: `typedef uint32_t VkBool32` -> `u32`,
+/// `struct ANativeWindow;` -> `u8` (opaque), `typedef void* MTLDevice_id` -> `Ptr[u8]`.
+pub fn basetype(td: registry.TypeDef) -> str {
+    let txt = match td.text.split_once("#else") {
+        Some(p) => p.right.clone()
+        None => td.text.clone()
+    }
+    if td.base.is_empty() {
+        return if txt.contains("*") { "Ptr[u8]" } else { "u8" }
+    }
+    let b = base(td.base)
+    return if txt.contains("*") { "Ptr[{b}]" } else { b }
+}
+
+/// What C type `ty` is, aliases followed: int, float, ptr, opaque, handle,
+/// enum, flags, struct, bits, union, fnptr, or "" if unknown.
+pub fn kind(r: registry.Registry, ty: str) -> str {
+    let prim = match ty {
+        "float" or "double" => "float"
+        "void" => "opaque"
+        "char" or "int" or "size_t" or "uint8_t" or "int8_t" or "uint16_t" or "int16_t" => "int"
+        "uint32_t" or "int32_t" or "uint64_t" or "int64_t" => "int"
+        _ => ""
+    }
+    if not prim.is_empty() {
+        return prim
+    }
+    let i = r.resolve(ty)
+    guard i >= 0 else {
+        return ""
+    }
+    return kind_of(r, r.types[i])
+}
+
+fn kind_of(r: registry.Registry, td: registry.TypeDef) -> str {
+    return match td.cat {
+        "external" => match external(td.name) {
+            "u8" => "opaque"
+            "Ptr[u8]" or "Ptr[u16]" => "ptr"
+            _ => "int"
+        }
+        "basetype" => match basetype(td) {
+            "u8" => "opaque"
+            "f32" => "float"
+            b if b.starts_with("Ptr[") => "ptr"
+            _ => "int"
+        }
+        "handle" => "handle"
+        "enum" => if is_flag_bits(r, td.name) { "flags" } else { "enum" }
+        "bitmask" => "flags"
+        "struct" => if bits_width(r, td) > 0 { "bits" } else { "struct" }
+        "union" => "union"
+        "funcpointer" => "fnptr"
+        _ => ""
+    }
+}
+
+pub fn is_flag_bits(r: registry.Registry, name: str) -> bool {
+    return match r.enum_ix.get(name) {
+        Some(e) => r.enums[e].bitmask
+        None => false
+    }
+}
+
+/// Storage unit of a bit field of type `ty`.
+pub fn unit_bits(ty: str) -> int {
+    return match ty {
+        "uint8_t" or "int8_t" => 8
+        "uint16_t" or "int16_t" => 16
+        "uint64_t" or "int64_t" => 64
+        _ => 32
+    }
+}
+
+/// A struct made only of bit fields that share one storage unit becomes a
+/// `bits(uN)` struct: its unit width, else 0.
+pub fn bits_width(r: registry.Registry, td: registry.TypeDef) -> int {
+    guard td.cat == "struct" and not td.members.is_empty() else {
+        return 0
+    }
+    let w = unit_bits(td.members[0].ty)
+    var used = 0
+    for m in td.members {
+        guard m.bits > 0 and unit_bits(m.ty) == w else {
+            return 0
+        }
+        used += m.bits
+    }
+    return if used <= w { w } else { 0 }
+}
+
+/// Array length: a literal or a constant's value.
+fn dim(r: registry.Registry, d: str) -> str {
+    return match r.const_ix.get(d) {
+        Some(i) => r.consts[i].value.clone()
+        None => d.clone()
+    }
+}
+
+/// Mica type of a member: pointers, arrays and nullable function pointers.
+pub fn field(r: registry.Registry, m: registry.Member) -> str {
+    return wrap(r, m, m.ptrs)
+}
+
+/// The type with `ptrs` pointer levels.
+pub fn wrap(r: registry.Registry, m: registry.Member, ptrs: int) -> str {
+    var t = base(m.ty)
+    if ptrs == 0 and kind(r, m.ty) == "fnptr" {
+        t = "Option[{t}]"
+    }
+    for _ in 0..ptrs {
+        t = "Ptr[{t}]"
+    }
+    var pre = ""
+    for d in m.dims {
+        pre += "[" + dim(r, d) + "]"
+    }
+    return pre + t
+}
+
+/// Does a member hold a raw pointer (directly, in an array or a union)?
+pub fn has_ptr(r: registry.Registry, m: registry.Member) -> bool {
+    if m.ptrs > 0 {
+        return true
+    }
+    let k = kind(r, m.ty)
+    if k == "ptr" {
+        return true
+    }
+    guard k == "union" else {
+        return false
+    }
+    for u in r.types[r.resolve(m.ty)].members {
+        if has_ptr(r, u) {
+            return true
+        }
+    }
+    return false
+}

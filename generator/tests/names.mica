@@ -1,0 +1,61 @@
+// Registry names -> Mica names.
+
+import generator.names
+import generator.registry
+import generator.xml
+
+test "snake" {
+    assert_eq(names.snake("ppEnabledLayerNames"), "pp_enabled_layer_names")
+    assert_eq(names.snake("maxImageDimension2D"), "max_image_dimension2d")
+    assert_eq(names.snake("deviceLUIDValid"), "device_luid_valid")
+    assert_eq(names.snake("textureCompressionASTC_LDR"), "texture_compression_astc_ldr")
+    assert_eq(names.snake("storageBuffer16BitAccess"), "storage_buffer16_bit_access")
+    assert_eq(names.snake("type"), "r#type")
+    assert_eq(names.command("vkGetPhysicalDeviceSurfaceCapabilities2KHR"), "get_physical_device_surface_capabilities2_khr")
+    assert_eq(names.command("vkCmdSetViewportWScalingNV"), "cmd_set_viewport_w_scaling_nv")
+}
+
+test "types and constants" {
+    assert_eq(names.type_name("VkImageLayout"), "ImageLayout")
+    assert_eq(names.type_name("VkResult"), "VkResult")
+    assert_eq(names.type_name("wl_display"), "WlDisplay")
+    assert_eq(names.type_name("StdVideoAV1Profile"), "StdVideoAV1Profile")
+    assert_eq(names.constant("VK_MAX_EXTENSION_NAME_SIZE"), "max_extension_name_size")
+    assert_eq(names.constant("VK_TRUE"), "r#true")
+    assert_eq(names.extension("VK_KHR_swapchain"), "KhrSwapchain")
+    assert_eq(names.parse_int("0x7FFFFFFF"), Some(2147483647))
+    assert_eq(names.parse_int("-12"), Some(-12))
+}
+
+test "variants" {
+    let tags = ["KHR", "EXT", "NV"]
+    assert_eq(names.variant("VkImageLayout", "VK_IMAGE_LAYOUT_GENERAL", false, tags), "GENERAL")
+    assert_eq(names.variant("VkResult", "VK_ERROR_OUT_OF_DATE_KHR", false, tags), "ERROR_OUT_OF_DATE_KHR")
+    assert_eq(names.variant("VkPresentModeKHR", "VK_PRESENT_MODE_FIFO_KHR", false, tags), "FIFO")
+    assert_eq(names.variant("VkImageType", "VK_IMAGE_TYPE_2D", false, tags), "TYPE_2D")
+    assert_eq(names.variant("VkBufferUsageFlagBits", "VK_BUFFER_USAGE_TRANSFER_SRC_BIT", true, tags), "TRANSFER_SRC")
+    assert_eq(names.variant("VkPipelineStageFlagBits2", "VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT", true, tags), "TRANSFORM_FEEDBACK_EXT")
+    assert_eq(names.variant("VkSampleCountFlagBits", "VK_SAMPLE_COUNT_4_BIT", true, tags), "TYPE_4")
+    assert_eq(names.variant("StdVideoH264ProfileIdc", "STD_VIDEO_H264_PROFILE_IDC_HIGH", false, tags), "HIGH")
+}
+
+test "depends names" {
+    assert_eq(registry.depends_name("VK_VERSION_1_1"), "V1_1")
+    assert_eq(registry.depends_name("VK_VERSION_1_1,VK_KHR_device_group"), "V1_1OrKhrDeviceGroup")
+    assert_eq(registry.depends_name("(VK_KHR_draw_indirect_count,VK_VERSION_1_2)+VK_EXT_mesh_shader"), "EitherKhrDrawIndirectCountOrV1_2AndExtMeshShader")
+    assert_eq(registry.depends_name("(VK_KHR_a+VK_KHR_b),VK_VERSION_1_3"), "BothKhrAAndKhrBOrV1_3")
+}
+
+test "depends names that clash are an error" {
+    let src = """
+        <registry><extensions><extension name="VK_KHR_x" number="1" supported="vulkan">
+        <require depends="VK_KHR_a_b"><command name="vkA"/></require>
+        <require depends="VK_KHR_a__b"><command name="vkB"/></require>
+        </extension></extensions></registry>
+        """
+    let doc = xml.parse(src).expect("xml")
+    var r = registry.new()
+    let res = registry.load(mut r, doc)
+    assert(res.is_err())
+    assert(res.unwrap_err().contains("KhrXKhrAB"))
+}

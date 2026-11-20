@@ -1,0 +1,8 @@
+[package]
+name = "vk_gpu"
+version = "0.1.0"
+description = "A high-level Vulkan 1.3 layer: handles, bindless, automatic barriers, frames"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+vk = { path = "../vk" }

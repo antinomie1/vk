@@ -1,0 +1,250 @@
+// A minimal XML reader for the Vulkan registry: elements, attributes, text
+// and the five predefined entities plus numeric references. Comments,
+// processing instructions and `<!DOCTYPE>` are skipped.
+
+import std.str
+import std.encoding.hex
+
+pub struct Attr {
+    key: str
+    val: str
+}
+
+/// An element, or a text node when `name` is empty.
+pub struct Node {
+    name: str
+    attrs: List[Attr]
+    kids: List[int]
+    text: str
+}
+
+/// Node 0 is the document; its element children are the roots.
+pub struct Doc {
+    nodes: List[Node]
+}
+
+pub fn parse(src: str) -> Result[Doc, str] {
+    var doc = Doc { nodes: [Node { name: "#doc", attrs: [], kids: [], text: "" }] }
+    var stack: List[int] = [0]
+    var i = 0
+    let n = src.len()
+    while i < n {
+        if src[i] != 60 {
+            var j = i
+            while j < n and src[j] != 60 {
+                j += 1
+            }
+            let parent = stack[stack.len() - 1]
+            doc.add(parent, Node { name: "", attrs: [], kids: [], text: decode(src.slice(i, j)) })
+            i = j
+            continue
+        }
+        if i + 3 < n and src[i + 1] == 33 and src[i + 2] == 45 and src[i + 3] == 45 {
+            guard let Some(e) = src.find_from("-->", i) else {
+                return Err("unterminated comment at byte {i}")
+            }
+            i = e + 3
+            continue
+        }
+        if i + 1 < n and (src[i + 1] == 63 or src[i + 1] == 33) {
+            guard let Some(e) = src.find_from(">", i) else {
+                return Err("unterminated declaration at byte {i}")
+            }
+            i = e + 1
+            continue
+        }
+        if i + 1 < n and src[i + 1] == 47 {
+            guard let Some(e) = src.find_from(">", i) else {
+                return Err("unterminated end tag at byte {i}")
+            }
+            let name = src.slice(i + 2, e).trim()
+            guard stack.len() > 1 else {
+                return Err("unexpected `</{name}>` at byte {i}")
+            }
+            let top = stack[stack.len() - 1]
+            guard doc.nodes[top].name == name else {
+                return Err("`</{name}>` closes `<{doc.nodes[top].name}>` at byte {i}")
+            }
+            discard stack.pop()
+            i = e + 1
+            continue
+        }
+        var j = i + 1
+        while j < n and not is_space(src[j]) and src[j] != 47 and src[j] != 62 {
+            j += 1
+        }
+        var node = Node { name: src.slice(i + 1, j), attrs: [], kids: [], text: "" }
+        var closed = false
+        while true {
+            while j < n and is_space(src[j]) {
+                j += 1
+            }
+            guard j < n else {
+                return Err("unterminated tag `<{node.name}>`")
+            }
+            if src[j] == 62 {
+                j += 1
+                break
+            }
+            if src[j] == 47 {
+                closed = true
+                j += 2
+                break
+            }
+            let k0 = j
+            while j < n and src[j] != 61 and not is_space(src[j]) {
+                j += 1
+            }
+            let key = src.slice(k0, j)
+            while j < n and src[j] != 34 and src[j] != 39 {
+                j += 1
+            }
+            guard j < n else {
+                return Err("attribute `{key}` has no value")
+            }
+            let q = src[j]
+            var e = j + 1
+            while e < n and src[e] != q {
+                e += 1
+            }
+            node.attrs.push(Attr { key, val: decode(src.slice(j + 1, e)) })
+            j = e + 1
+        }
+        let parent = stack[stack.len() - 1]
+        let id = doc.add(parent, node)
+        if not closed {
+            stack.push(id)
+        }
+        i = j
+    }
+    guard stack.len() == 1 else {
+        return Err("unclosed `<{doc.nodes[stack[stack.len() - 1]].name}>`")
+    }
+    return Ok(doc)
+}
+
+fn is_space(c: u8) -> bool {
+    return c == 32 or c == 9 or c == 10 or c == 13
+}
+
+fn Doc.add(mut self, parent: int, take node: Node) -> int {
+    let id = self.nodes.len()
+    self.nodes.push(node)
+    self.nodes[parent].kids.push(id)
+    return id
+}
+
+/// `&lt;` `&gt;` `&amp;` `&quot;` `&apos;` `&#N;` `&#xN;`.
+fn decode(s: str) -> str {
+    guard s.contains("&") else {
+        return s.clone()
+    }
+    var out = ""
+    var i = 0
+    while i < s.len() {
+        if s[i] == 38 {
+            if let Some(e) = s.find_from(";", i) {
+                let ent = s.slice(i + 1, e)
+                let rep = match ent {
+                    "lt" => "<"
+                    "gt" => ">"
+                    "amp" => "&"
+                    "quot" => "\""
+                    "apos" => "'"
+                    _ => char_ref(ent)
+                }
+                if not rep.is_empty() {
+                    out += rep
+                    i = e + 1
+                    continue
+                }
+            }
+        }
+        out += s.slice(i, i + 1)
+        i += 1
+    }
+    return out
+}
+
+fn char_ref(ent: str) -> str {
+    guard ent.starts_with("#") else {
+        return ""
+    }
+    var c = 0
+    if ent.starts_with("#x") {
+        for b in ent.slice(2, ent.len()) {
+            c = c * 16 + hex.digit(b)
+        }
+    } else {
+        c = ent.slice(1, ent.len()).to_int().unwrap_or(0)
+    }
+    guard c > 0 and c < 128 else {
+        return ""
+    }
+    return str.from_byte(u8(c))
+}
+
+/// Attribute `key` of node `n`, or "".
+pub fn Doc.attr(self, n: int, key: str) -> str {
+    for a in self.nodes[n].attrs {
+        if a.key == key {
+            return a.val.clone()
+        }
+    }
+    return ""
+}
+
+pub fn Doc.has(self, n: int, key: str) -> bool {
+    for a in self.nodes[n].attrs {
+        if a.key == key {
+            return true
+        }
+    }
+    return false
+}
+
+pub fn Doc.name(self, n: int) -> str {
+    return self.nodes[n].name.clone()
+}
+
+/// Element children of `n` named `name` ("" for every element).
+pub fn Doc.elems(self, n: int, name: str) -> List[int] {
+    var out: List[int] = []
+    for k in self.nodes[n].kids {
+        let kn = self.nodes[k].name.clone()
+        if not kn.is_empty() and (name.is_empty() or kn == name) {
+            out.push(k)
+        }
+    }
+    return out
+}
+
+/// First element child named `name`, or -1.
+pub fn Doc.first(self, n: int, name: str) -> int {
+    for k in self.nodes[n].kids {
+        if self.nodes[k].name == name {
+            return k
+        }
+    }
+    return -1
+}
+
+/// Concatenated text of `n` and its descendants ("" for -1).
+pub fn Doc.text(self, n: int) -> str {
+    var out = ""
+    guard n >= 0 else {
+        return out
+    }
+    self.collect(n, mut out)
+    return out
+}
+
+fn Doc.collect(self, n: int, mut out: str) {
+    if self.nodes[n].name.is_empty() {
+        out += self.nodes[n].text
+        return
+    }
+    for k in self.nodes[n].kids {
+        self.collect(k, mut out)
+    }
+}

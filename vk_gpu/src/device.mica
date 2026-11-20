@@ -1,0 +1,773 @@
+// The device: one graphics + compute queue, a timeline semaphore that every
+// submit advances, and the resources. Destroying a resource only queues it;
+// it is freed once the GPU has passed the submit that followed it.
+
+import std.collections.deque
+import std.mem
+import std.collections.slotmap
+import vk
+import ctx
+import alloc
+import sync
+import bindless
+import res
+import encoder
+import pipeline
+import boot
+import record
+import external
+
+pub struct Options {
+    pub app_name: str = "vk_gpu"
+    /// Load VK_LAYER_KHRONOS_validation when it is installed.
+    pub validation: bool = false
+    /// Skip the surface and swapchain extensions (tests, compute).
+    pub headless: bool = false
+    /// Bindless array size, clamped to what the device allows.
+    pub max_textures: u32 = 16384
+}
+
+enum Garbage {
+    Tex(slotmap.Handle)
+    Buf(slotmap.Handle)
+    Pipe(slotmap.Handle)
+    Cmd(vk.CommandBuffer)
+    Chunk(int)
+    Sem(vk.Semaphore)
+}
+
+struct Retired {
+    at: u64
+    g: Garbage
+}
+
+/// A buffer the upload ring hands out in slices.
+struct Chunk {
+    buf: slotmap.Handle
+    raw: vk.Buffer
+    addr: u64
+    mapped: u64
+    size: u64
+}
+
+pub struct Device {
+    st: vk.StaticFn
+    cx: ctx.Ctx
+    /// Stamped into every handle, so another device's handles are rejected.
+    id: u64
+    max_groups: [3]u32
+    /// Placeholders every free bindless slot points at (slots 0 and 1).
+    blank: vk.ImageView = vk.ImageView {}
+    blank_storage: vk.ImageView = vk.ImageView {}
+    wsi: boot.Wsi
+    bl: bindless.Bindless
+    max_textures: u32
+    mem: alloc.Allocator
+    textures: slotmap.SlotMap[res.TexInfo]
+    buffers: slotmap.SlotMap[res.BufInfo]
+    pipelines: slotmap.SlotMap[res.PipeInfo]
+    cmd_pool: vk.CommandPool
+    free_cmds: List[vk.CommandBuffer]
+    timeline: vk.Semaphore
+    submitted: u64
+    completed: u64
+    /// Encoders handed out and not yet submitted.
+    open: int
+    /// Garbage waiting for a submit with no open encoder.
+    limbo: List[Garbage]
+    /// Upload-ring chunks waiting for the submit that reads them.
+    chunk_limbo: List[int] = []
+    retire: deque.Deque[Retired]
+    /// Textures made since the last submit, still `Undefined`.
+    fresh: List[res.Texture]
+    chunks: List[Chunk]
+    free_chunks: List[int]
+    chunk: int
+    head: u64
+    /// Recycled encoder lists, so recording allocates nothing in steady state.
+    spare: List[encoder.Lists]
+    /// Scratch for `submit_sync`, reused.
+    bars: List[vk.ImageMemoryBarrier2] = []
+    cb_infos: List[vk.CommandBufferSubmitInfo] = []
+    wait_infos: List[vk.SemaphoreSubmitInfo] = []
+    signal_infos: List[vk.SemaphoreSubmitInfo] = []
+    /// Free binary semaphores (exportable as sync_file).
+    sems: List[vk.Semaphore] = []
+    /// Imported fences the next submit waits for.
+    waits: List[vk.Semaphore] = []
+    /// The next submit also signals `exported`, read back as a sync_file.
+    export_next: bool = false
+    exported: vk.Semaphore = vk.Semaphore {}
+    /// Tearing down: free slots are not re-pointed at the placeholders.
+    closing: bool = false
+    ext: boot.External
+}
+
+let chunk_size: u64 = 8388608
+
+pub fn Device.open(o: Options) -> Result[Device, str] {
+    let st = try vk.StaticFn.open(vk.loader_name)
+    let base = try boot.create(st, o)
+    let cx = base.cx
+    var pool = vk.CommandPool {}
+    let pinfo = vk.CommandPoolCreateInfo { flags: vk.CommandPoolCreateFlags.RESET_COMMAND_BUFFER, queue_family_index: cx.family }
+    unsafe try ctx.ok(cx.fns.create_command_pool(cx.device, Ptr.of(pinfo), Ptr.null(), mut pool), "vkCreateCommandPool")
+    let tl = vk.SemaphoreTypeCreateInfo { semaphore_type: vk.SemaphoreType.TIMELINE }
+    unsafe let sinfo = vk.SemaphoreCreateInfo { p_next: Ptr.of(tl).cast[u8]() }
+    var timeline = vk.Semaphore {}
+    unsafe try ctx.ok(cx.fns.create_semaphore(cx.device, Ptr.of(sinfo), Ptr.null(), mut timeline), "vkCreateSemaphore")
+    var dev = Device {
+        st,
+        cx,
+        id: u64(cx.device.raw),
+        max_groups: base.max_groups,
+        wsi: base.wsi,
+        ext: base.ext,
+        bl: base.bl,
+        max_textures: base.max_textures,
+        mem: alloc.new(base.mem_props),
+        textures: slotmap.SlotMap.new(),
+        buffers: slotmap.SlotMap.new(),
+        pipelines: slotmap.SlotMap.new(),
+        cmd_pool: pool,
+        free_cmds: [],
+        timeline,
+        submitted: 0,
+        completed: 0,
+        open: 0,
+        limbo: [],
+        retire: deque.Deque.new(),
+        fresh: [],
+        chunks: [],
+        free_chunks: [],
+        chunk: -1,
+        head: 0,
+        spare: [],
+    }
+    try dev.placeholders()
+    return Ok(dev)
+}
+
+/// Slots 0 (sampled) and 1 (storage): 1x1 transparent black, pointed at by
+/// every bindless slot not holding a live texture.
+fn Device.placeholders(mut self) -> Result[(), str] {
+    let cx = self.cx
+    var views: List[vk.ImageView] = []
+    var bars: List[vk.ImageMemoryBarrier2] = []
+    var after: List[vk.ImageMemoryBarrier2] = []
+    for storage in [false, true] {
+        let d = res.TextureDesc { width: 1, height: 1, storage }
+        let info = try res.create_texture(cx, mut self.mem, d)
+        let u = if storage { sync.Use.Storage } else { sync.Use.Sampled }
+        bars.push(sync.barrier(info.image, info.aspect, sync.Use.Undefined, sync.Use.CopyDst))
+        after.push(sync.barrier(info.image, info.aspect, sync.Use.CopyDst, u))
+        views.push(info.view)
+        var placed = info
+        placed.state = u
+        discard self.textures.insert(placed)
+    }
+    self.blank = views[0]
+    self.blank_storage = views[1]
+    bindless.fill(cx, self.max_textures, self.blank, self.blank_storage)
+
+    let cb = try self.command_buffer()
+    let begin = vk.CommandBufferBeginInfo { flags: vk.CommandBufferUsageFlags.ONE_TIME_SUBMIT }
+    unsafe try ctx.ok(cx.cmd.begin(cb, Ptr.of(begin)), "vkBeginCommandBuffer")
+    unsafe let dep = vk.DependencyInfo { image_memory_barrier_count: 2, p_image_memory_barriers: bars.as_ptr() }
+    unsafe cx.cmd.barrier(cb, Ptr.of(dep))
+    let zero = vk.ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] }
+    let all = vk.ImageSubresourceRange { aspect_mask: vk.ImageAspectFlags.COLOR, level_count: 1, layer_count: 1 }
+    for b in bars {
+        unsafe cx.cmd.clear_color_image(cb, b.image, vk.ImageLayout.TRANSFER_DST_OPTIMAL, Ptr.of(zero), 1, Ptr.of(all))
+    }
+    unsafe let dep2 = vk.DependencyInfo { image_memory_barrier_count: 2, p_image_memory_barriers: after.as_ptr() }
+    unsafe cx.cmd.barrier(cb, Ptr.of(dep2))
+    try ctx.ok(cx.cmd.end(cb), "vkEndCommandBuffer")
+    try self.submit_raw(cb, vk.Semaphore {}, vk.Semaphore {})
+    return Ok(())
+}
+
+// ---- timeline ----
+
+/// True once the GPU has finished the submit `t` names.
+pub fn Device.done(mut self, t: res.Ticket) -> bool {
+    if t.value > self.completed {
+        var v: u64 = 0
+        discard self.cx.v12.get_semaphore_counter_value(self.cx.device, self.timeline, mut v)
+        self.completed = v
+    }
+    return t.value <= self.completed
+}
+
+/// Block until `t` is done.
+pub fn Device.wait(mut self, t: res.Ticket) -> Result[(), str] {
+    guard not self.done(t) else {
+        return Ok(())
+    }
+    unsafe let info = vk.SemaphoreWaitInfo { semaphore_count: 1, p_semaphores: Ptr.of(self.timeline), p_values: Ptr.of(t.value) }
+    unsafe try ctx.ok(self.cx.v12.wait_semaphores(self.cx.device, Ptr.of(info), ~u64(0)), "vkWaitSemaphores")
+    self.completed = max(self.completed, t.value)
+    self.collect()
+    return Ok(())
+}
+
+/// Block until everything submitted is done.
+pub fn Device.idle(mut self) -> Result[(), str] {
+    return self.wait(res.Ticket { value: self.submitted })
+}
+
+/// Wait for the queue including presentation (which the timeline does not
+/// cover), before a swapchain or its semaphores are destroyed.
+fn Device.drain(mut self) -> Result[(), str] {
+    try ctx.ok(self.cx.fns.device_wait_idle(self.cx.device), "vkDeviceWaitIdle")
+    self.completed = self.submitted
+    self.collect()
+    return Ok(())
+}
+
+/// Free the garbage whose submit has completed.
+fn Device.collect(mut self) {
+    while true {
+        guard let Some(r) = self.retire.front() else {
+            return
+        }
+        guard self.done(res.Ticket { value: r.at }) else {
+            return
+        }
+        discard self.retire.pop_front()
+        self.free(r.g)
+    }
+}
+
+fn Device.free(mut self, g: Garbage) {
+    let cx = self.cx
+    match g {
+        Tex(h) => {
+            if let Some(t) = self.textures.remove(h) {
+                if not t.sc and not self.closing {
+                    bindless.write(cx, h.index, self.blank, self.blank_storage)
+                }
+                cx.fns.destroy_image_view(cx.device, t.view, Ptr.null())
+                if t.owned {
+                    cx.fns.destroy_image(cx.device, t.image, Ptr.null())
+                    self.mem.free(cx, t.mem)
+                }
+            }
+        }
+        Buf(h) => {
+            if let Some(b) = self.buffers.remove(h) {
+                cx.fns.destroy_buffer(cx.device, b.raw, Ptr.null())
+                self.mem.free(cx, b.mem)
+            }
+        }
+        Pipe(h) => {
+            if let Some(p) = self.pipelines.remove(h) {
+                cx.fns.destroy_pipeline(cx.device, p.raw, Ptr.null())
+            }
+        }
+        Cmd(cb) => self.free_cmds.push(cb)
+        Chunk(i) => self.free_chunks.push(i)
+        Sem(sem) => self.sems.push(sem)
+    }
+}
+
+/// Destroy `g` once no open encoder can still submit it: right away when
+/// none is open (it is marked dead, so later encoders are rejected), else
+/// when the last open one is submitted or cancelled.
+fn Device.later(mut self, take g: Garbage) {
+    match g {
+        Chunk(i) => {
+            // Staged bytes are for the next submit, whenever it comes.
+            self.chunk_limbo.push(i)
+            return
+        }
+        _ => {}
+    }
+    self.limbo.push(g)
+    self.flush_limbo()
+}
+
+fn Device.kill(mut self, g: Garbage) {
+    match g {
+        Tex(h) => {
+            discard self.textures.update(h, fn(mut i) {
+                i.dead = true
+            })
+        }
+        Buf(h) => {
+            discard self.buffers.update(h, fn(mut i) {
+                i.dead = true
+            })
+        }
+        Pipe(h) => {
+            discard self.pipelines.update(h, fn(mut i) {
+                i.dead = true
+            })
+        }
+        _ => {}
+    }
+}
+
+// ---- recording and submission ----
+
+/// An empty encoder. Submit it (`submit`, a target's `present`) or
+/// `cancel` it: until then destroyed resources stay alive.
+pub fn Device.encoder(mut self) -> Result[encoder.Encoder, str] {
+    self.collect()
+    self.open += 1
+    return Ok(encoder.new(self.id, self.spare.pop().unwrap_or(encoder.Lists {})))
+}
+
+/// Drop `e` unsubmitted.
+pub fn Device.cancel(mut self, take e: encoder.Encoder) {
+    self.open -= 1
+    self.flush_limbo()
+    self.spare.push(e.recycle())
+}
+
+fn Device.command_buffer(mut self) -> Result[vk.CommandBuffer, str] {
+    if let Some(cb) = self.free_cmds.pop() {
+        try ctx.ok(self.cx.fns.reset_command_buffer(cb, vk.CommandBufferResetFlags(0)), "vkResetCommandBuffer")
+        return Ok(cb)
+    }
+    let info = vk.CommandBufferAllocateInfo { command_pool: self.cmd_pool, level: vk.CommandBufferLevel.PRIMARY, command_buffer_count: 1 }
+    var cbs: List[vk.CommandBuffer] = [vk.CommandBuffer {}]
+    unsafe try ctx.ok(self.cx.fns.allocate_command_buffers(self.cx.device, Ptr.of(info), cbs), "vkAllocateCommandBuffers")
+    return Ok(cbs[0])
+}
+
+/// Submit `e`; an `Err` when it names a destroyed or foreign resource or
+/// breaks a usage rule, and then nothing was submitted.
+pub fn Device.submit(mut self, take e: encoder.Encoder) -> Result[res.Ticket, str] {
+    return self.submit_sync(take e, vk.Semaphore {}, vk.Semaphore {})
+}
+
+/// Check and record `e`, then submit it waiting on binary semaphore `wait`
+/// and signaling `signal` (each when non-null) besides the timeline.
+fn Device.submit_sync(mut self, take e: encoder.Encoder, wait: vk.Semaphore, signal: vk.Semaphore) -> Result[res.Ticket, str] {
+    if let Err(msg) = record.check(self, e) {
+        self.cancel(take e)
+        return Err(msg)
+    }
+    let cb = try self.command_buffer()
+    if let Err(msg) = record.translate(mut self, e, cb) {
+        self.free_cmds.push(cb)
+        self.cancel(take e)
+        return Err(msg)
+    }
+    let t = try self.submit_raw(cb, wait, signal)
+    self.open -= 1
+    self.flush_limbo()
+    self.spare.push(e.recycle())
+    return Ok(t)
+}
+
+/// Garbage destroyed while encoders were open waits for them; once none
+/// is open it is freed after the last submit.
+fn Device.flush_limbo(mut self) {
+    guard self.open == 0 else {
+        return
+    }
+    for g in mem.replace(mut self.limbo, []) {
+        self.kill(g)
+        self.retire.push_back(Retired { at: self.submitted, g })
+    }
+    for i in mem.replace(mut self.chunk_limbo, []) {
+        self.retire.push_back(Retired { at: self.submitted, g: Garbage.Chunk(i) })
+    }
+}
+
+/// Submit recorded `cb`, waiting on `wait` and fences from
+/// `wait_sync_file`; signaling the timeline, `signal` and, after
+/// `export_next`, `exported` (null semaphores are skipped).
+fn Device.submit_raw(mut self, cb: vk.CommandBuffer, wait: vk.Semaphore, signal: vk.Semaphore) -> Result[res.Ticket, str] {
+    let all = vk.PipelineStageFlags2.ALL_COMMANDS
+    let value = self.submitted + 1
+    self.cb_infos.clear()
+    self.cb_infos.push(vk.CommandBufferSubmitInfo { command_buffer: cb })
+    self.wait_infos.clear()
+    if wait.raw != 0 {
+        self.wait_infos.push(vk.SemaphoreSubmitInfo { semaphore: wait, stage_mask: all })
+    }
+    for i in 0..self.waits.len() {
+        let s = self.waits[i]
+        self.wait_infos.push(vk.SemaphoreSubmitInfo { semaphore: s, stage_mask: all })
+    }
+    self.signal_infos.clear()
+    self.signal_infos.push(vk.SemaphoreSubmitInfo { semaphore: self.timeline, value, stage_mask: all })
+    if signal.raw != 0 {
+        self.signal_infos.push(vk.SemaphoreSubmitInfo { semaphore: signal, stage_mask: all })
+    }
+    self.exported = vk.Semaphore {}
+    if self.export_next {
+        self.export_next = false
+        self.exported = try self.binary()
+        self.signal_infos.push(vk.SemaphoreSubmitInfo { semaphore: self.exported, stage_mask: all })
+    }
+    unsafe let info = vk.SubmitInfo2 {
+        wait_semaphore_info_count: u32(self.wait_infos.len()),
+        p_wait_semaphore_infos: self.wait_infos.as_ptr(),
+        command_buffer_info_count: 1,
+        p_command_buffer_infos: self.cb_infos.as_ptr(),
+        signal_semaphore_info_count: u32(self.signal_infos.len()),
+        p_signal_semaphore_infos: self.signal_infos.as_ptr(),
+    }
+    unsafe let r = self.cx.v13.queue_submit2(self.cx.queue, 1, Ptr.of(info), vk.Fence {})
+    try ctx.ok(r, "vkQueueSubmit2")
+    self.submitted = value
+    self.retire.push_back(Retired { at: value, g: Garbage.Cmd(cb) })
+    for s in mem.replace(mut self.waits, []) {
+        self.retire.push_back(Retired { at: value, g: Garbage.Sem(s) })
+    }
+    if self.exported.raw != 0 {
+        self.retire.push_back(Retired { at: value, g: Garbage.Sem(self.exported) })
+    }
+    return Ok(res.Ticket { value })
+}
+
+fn Device.state(self, t: res.Texture) -> sync.Use {
+    return self.textures.with(t.h, fn(i) => i.state).unwrap_or(sync.Use.Undefined)
+}
+
+fn Device.set_state(mut self, t: res.Texture, u: sync.Use) {
+    discard self.textures.update(t.h, fn(mut i) {
+        i.state = u
+    })
+}
+
+// ---- resources ----
+
+pub fn Device.texture(mut self, d: res.TextureDesc) -> Result[res.Texture, str] {
+    guard d.width > 0 and d.height > 0 else {
+        return Err("texture size {d.width}x{d.height}")
+    }
+    let info = try res.create_texture(self.cx, mut self.mem, d)
+    return self.register(info, false)
+}
+
+/// Give `info` a handle and its bindless slot.
+fn Device.register(mut self, take info: res.TexInfo, ext: bool) -> Result[res.Texture, str] {
+    let view = info.view
+    let storage = info.storage
+    let t = res.Texture { h: zeroed(), dev: self.id, width: info.width, height: info.height, format: info.format, ext }
+    let h = self.textures.insert(info)
+    if h.index >= self.max_textures {
+        self.free(Garbage.Tex(h))
+        return Err("more than {self.max_textures - 2} textures (Options.max_textures)")
+    }
+    bindless.write(self.cx, h.index, view, if storage { view } else { self.blank_storage })
+    let tex = res.Texture { h, ..t }
+    self.fresh.push(tex)
+    return Ok(tex)
+}
+
+/// Track a swapchain image so encoders can render into and present it.
+fn Device.adopt(mut self, image: vk.Image, format: vk.Format, width: u32, height: u32) -> Result[res.Texture, str] {
+    let view = try res.view(self.cx, image, format)
+    let info = res.TexInfo {
+        image,
+        view,
+        mem: zeroed(),
+        state: sync.Use.Undefined,
+        owned: false,
+        format,
+        width,
+        height,
+        aspect: vk.ImageAspectFlags.COLOR,
+        sc: true,
+        copy: false,
+    }
+    let h = self.textures.insert(info)
+    return Ok(res.Texture { h, dev: self.id, width, height, format })
+}
+
+/// Forget a swapchain image now (the device is idle).
+fn Device.unadopt(mut self, t: res.Texture) {
+    self.free(Garbage.Tex(t.h))
+}
+
+/// Destroy `t` (another device's handle, or a second destroy, is ignored).
+pub fn Device.destroy_texture(mut self, t: res.Texture) {
+    guard t.dev == self.id and self.textures.get(t.h).map(fn(i) => not i.sc).unwrap_or(false) else {
+        return
+    }
+    self.later(Garbage.Tex(t.h))
+}
+
+/// A buffer of `size` bytes in `mem`; every usage is enabled.
+pub fn Device.buffer(mut self, size: u64, mem: alloc.Mem) -> Result[res.Buffer, str] {
+    guard size > 0 else {
+        return Err("empty buffer")
+    }
+    let info = try res.create_buffer(self.cx, mut self.mem, size, mem)
+    let addr = res.address(self.cx, info.raw)
+    return Ok(res.Buffer { h: self.buffers.insert(info), dev: self.id, addr, size })
+}
+
+pub fn Device.destroy_buffer(mut self, b: res.Buffer) {
+    guard b.dev == self.id and not self.chunks.any(fn(c) => c.buf == b.h) else {
+        return
+    }
+    self.later(Garbage.Buf(b.h))
+}
+
+pub fn Device.graphics(mut self, d: pipeline.Graphics, vs: str, fs: str) -> Result[res.Pipeline, str] {
+    guard d.color != vk.Format.UNDEFINED or d.depth != vk.Format.UNDEFINED else {
+        return Err("a graphics pipeline needs a color or depth format")
+    }
+    let raw = try pipeline.graphics(self.cx, d, vs, fs)
+    let point = vk.PipelineBindPoint.GRAPHICS
+    let h = self.pipelines.insert(res.PipeInfo { raw, point, color: d.color, depth: d.depth })
+    return Ok(res.Pipeline { h, dev: self.id, point })
+}
+
+pub fn Device.compute(mut self, cs: str) -> Result[res.Pipeline, str] {
+    let raw = try pipeline.compute(self.cx, cs)
+    let point = vk.PipelineBindPoint.COMPUTE
+    let h = self.pipelines.insert(res.PipeInfo { raw, point, color: vk.Format.UNDEFINED, depth: vk.Format.UNDEFINED })
+    return Ok(res.Pipeline { h, dev: self.id, point })
+}
+
+pub fn Device.destroy_pipeline(mut self, p: res.Pipeline) {
+    guard p.dev == self.id else {
+        return
+    }
+    self.later(Garbage.Pipe(p.h))
+}
+
+/// Live textures, buffers and pipelines (swapchain images, placeholders
+/// and the upload ring excluded); 0 after everything was destroyed and
+/// collected.
+pub fn Device.live(self) -> int {
+    var n = self.buffers.len() - self.chunks.len() + self.pipelines.len() - 2
+    for t in self.textures.values() {
+        if t.owned {
+            n += 1
+        }
+    }
+    return n
+}
+
+/// `b`'s memory, when `b` is alive and this device's.
+fn Device.buf(self, b: res.Buffer) -> Result[res.BufInfo, str] {
+    guard b.dev == self.id else {
+        return Err("buffer belongs to another device")
+    }
+    guard let Some(i) = self.buffers.get(b.h) else {
+        return Err("buffer was destroyed")
+    }
+    guard not i.dead else {
+        return Err("buffer was destroyed")
+    }
+    return Ok(i)
+}
+
+fn Device.tex(self, t: res.Texture) -> Result[res.TexInfo, str] {
+    guard t.dev == self.id else {
+        return Err("texture belongs to another device")
+    }
+    guard let Some(i) = self.textures.get(t.h) else {
+        return Err("texture was destroyed")
+    }
+    guard not i.dead else {
+        return Err("texture was destroyed")
+    }
+    return Ok(i)
+}
+
+// ---- sharing (external.mica) ----
+
+/// Wrap one plane of a client's dmabuf as a texture to sample; on success
+/// the texture owns `d.fd`. Bracket its use in an encoder with
+/// `e.acquire(t)` and `e.release(t)`.
+pub fn Device.import_dmabuf(mut self, d: external.Dmabuf) -> Result[res.Texture, str] {
+    guard d.width > 0 and d.height > 0 and d.fd >= 0 else {
+        return Err("dmabuf {d.width}x{d.height} fd {d.fd}")
+    }
+    let info = try external.import_image(self.cx, self.ext, self.mem, d)
+    return self.register(info, true)
+}
+
+/// A linear render target other processes can read, and its dmabuf (the
+/// caller owns the fd).
+pub fn Device.export_dmabuf(mut self, d: res.TextureDesc) -> Result[(res.Texture, external.Dmabuf), str] {
+    let (info, buf) = try external.export_image(self.cx, self.ext, self.mem, d)
+    let t = try self.register(info, false)
+    return Ok((t, buf))
+}
+
+/// The next submit waits for sync_file `fd` (taken; -1 means signaled).
+pub fn Device.wait_sync_file(mut self, fd: i32) -> Result[(), str] {
+    let sem = try self.binary()
+    match external.import_fence(self.cx, self.ext, sem, fd) {
+        Ok => self.waits.push(sem)
+        Err(e) => {
+            self.sems.push(sem)
+            return Err(e)
+        }
+    }
+    return Ok(())
+}
+
+/// Submit `e` and return a sync_file signaled when it completes (the
+/// caller owns the fd), e.g. for a Wayland explicit-sync release point.
+pub fn Device.submit_sync_file(mut self, take e: encoder.Encoder) -> Result[(res.Ticket, i32), str] {
+    self.export_next = true
+    let t = try self.submit_sync(take e, vk.Semaphore {}, vk.Semaphore {})
+    let fd = try external.export_fence(self.cx, self.ext, self.exported)
+    return Ok((t, fd))
+}
+
+fn Device.binary(mut self) -> Result[vk.Semaphore, str] {
+    if let Some(s) = self.sems.pop() {
+        return Ok(s)
+    }
+    return external.binary(self.cx)
+}
+
+// ---- uploads ----
+
+/// Copy `data` into the upload ring; shaders read it at `addr()`. The
+/// bytes stay valid until the GPU finishes the next submit.
+pub fn Device.stage(mut self, data: &[u8]) -> Result[res.Staged, str] {
+    let n = (u64(data.len()) + 255) / 256 * 256
+    if self.chunk < 0 or self.head + n > self.chunks[self.chunk].size {
+        if self.chunk >= 0 {
+            self.later(Garbage.Chunk(self.chunk))
+        }
+        self.chunk = try self.new_chunk(n)
+        self.head = 0
+    }
+    let c = self.chunks[self.chunk]
+    let off = self.head
+    self.head += n
+    if data.len() > 0 {
+        unsafe Ptr.copy(Ptr[u8].from_addr(usize(c.mapped + off)), data.as_ptr(), data.len())
+    }
+    return Ok(res.Staged { buffer: c.raw, offset: off, addr: c.addr + off })
+}
+
+fn Device.new_chunk(mut self, n: u64) -> Result[int, str] {
+    for k in 0..self.free_chunks.len() {
+        let i = self.free_chunks[k]
+        if self.chunks[i].size >= n {
+            discard self.free_chunks.remove(k)
+            return Ok(i)
+        }
+    }
+    let size = max(chunk_size, n)
+    let b = try self.buffer(size, alloc.Mem.Upload)
+    let i = try self.buf(b)
+    self.chunks.push(Chunk { buf: b.h, raw: i.raw, addr: b.addr, mapped: i.mem.addr, size })
+    return Ok(self.chunks.len() - 1)
+}
+
+/// Write `data` at `offset` in `b`: directly when `b` is host-visible
+/// (the GPU must not be reading that range), else through the upload ring
+/// and a copy recorded in `e`.
+pub fn Device.write(mut self, mut e: encoder.Encoder, b: res.Buffer, offset: u64, data: &[u8]) -> Result[(), str] {
+    let i = try self.buf(b)
+    guard e.dev == self.id else {
+        return Err("encoder belongs to another device")
+    }
+    guard offset + u64(data.len()) <= b.size else {
+        return Err("write of {data.len()} bytes at {offset} overruns a {b.size}-byte buffer")
+    }
+    if i.mem.addr != 0 {
+        unsafe Ptr.copy(Ptr[u8].from_addr(usize(i.mem.addr + offset)), data.as_ptr(), data.len())
+        return Ok(())
+    }
+    let s = try self.stage(data)
+    e.push_cmd(encoder.Cmd.Copy(s, b, offset, u64(data.len())))
+    return Ok(())
+}
+
+/// Fill all of `t` from tightly packed texels; shaders may sample it once
+/// `e` is submitted.
+pub fn Device.write_texture(mut self, mut e: encoder.Encoder, t: res.Texture, data: &[u8]) -> Result[(), str] {
+    let i = try self.tex(t)
+    guard e.dev == self.id and not i.sc and not i.ext else {
+        return Err("cannot write this texture with this encoder")
+    }
+    let need = u64(i.width) * u64(i.height) * res.texel_size(i.format)
+    guard need > 0 and u64(data.len()) == need else {
+        return Err("texture {i.width}x{i.height} {i.format} needs {need} bytes, got {data.len()}")
+    }
+    let s = try self.stage(data)
+    e.push_cmd(encoder.Cmd.Upload(s, t))
+    return Ok(())
+}
+
+/// Bytes `[offset, offset + len)` of a host-visible buffer (wait for the
+/// ticket of the work that wrote them first).
+pub fn Device.read(self, b: res.Buffer, offset: u64, len: int) -> Result[List[u8], str] {
+    let i = try self.buf(b)
+    guard i.mem.addr != 0 else {
+        return Err("buffer is not host-visible (use Mem.Readback)")
+    }
+    guard len >= 0 and offset + u64(len) <= b.size else {
+        return Err("read of {len} bytes at {offset} overruns a {b.size}-byte buffer")
+    }
+    var out: List[u8] = List.with_cap(len)
+    unsafe {
+        Ptr.copy(out.as_ptr(), Ptr[u8].from_addr(usize(i.mem.addr + offset)), len)
+        out.set_len(len)
+    }
+    return Ok(out)
+}
+
+/// Every texel of `t`, tightly packed; waits for the GPU.
+pub fn Device.read_texture(mut self, t: res.Texture) -> Result[List[u8], str] {
+    let i = try self.tex(t)
+    let n = u64(i.width) * u64(i.height) * res.texel_size(i.format)
+    guard n > 0 else {
+        return Err("cannot read back {i.format}")
+    }
+    let b = try self.buffer(n, alloc.Mem.Readback)
+    var e = try self.encoder()
+    e.push_cmd(encoder.Cmd.Download(t, b))
+    let out = self.download(take e, b, int(n))
+    self.destroy_buffer(b)
+    return out
+}
+
+fn Device.download(mut self, take e: encoder.Encoder, b: res.Buffer, n: int) -> Result[List[u8], str] {
+    try self.wait(try self.submit(take e))
+    return self.read(b, 0, n)
+}
+
+// ---- teardown ----
+
+fn Device.drop(mut self) {
+    let cx = self.cx
+    discard cx.fns.device_wait_idle(cx.device)
+    self.closing = true
+    self.completed = self.submitted
+    for g in mem.replace(mut self.limbo, []) {
+        self.free(g)
+    }
+    while not self.retire.is_empty() {
+        self.free(self.retire.pop_front().unwrap().g)
+    }
+    while not self.textures.is_empty() {
+        self.free(Garbage.Tex(self.textures.handle_at(0)))
+    }
+    while not self.buffers.is_empty() {
+        self.free(Garbage.Buf(self.buffers.handle_at(0)))
+    }
+    while not self.pipelines.is_empty() {
+        self.free(Garbage.Pipe(self.pipelines.handle_at(0)))
+    }
+    for sem in self.sems {
+        cx.fns.destroy_semaphore(cx.device, sem, Ptr.null())
+    }
+    for sem in self.waits {
+        cx.fns.destroy_semaphore(cx.device, sem, Ptr.null())
+    }
+    self.mem.destroy(cx)
+    cx.fns.destroy_semaphore(cx.device, self.timeline, Ptr.null())
+    cx.fns.destroy_command_pool(cx.device, self.cmd_pool, Ptr.null())
+    self.bl.destroy(cx.fns, cx.device)
+    cx.fns.destroy_device(cx.device, Ptr.null())
+    cx.inst.destroy_instance(cx.instance, Ptr.null())
+}

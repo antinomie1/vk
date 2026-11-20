@@ -1,0 +1,460 @@
+// Submit: check an encoder's commands, then translate them into a command
+// buffer. `check` rejects anything that would hand the driver a dead or
+// foreign object or break a valid-usage rule (a format the pipeline was not
+// built for, an index or indirect range past the buffer, a usage the
+// texture lacks), so it is an `Err` and nothing is recorded. `translate`
+// then moves each texture from its device-wide state into the state each
+// command needs, batching barriers before every scope. Writers publish:
+// after a pass or copy, the textures written move to `Sampled` and buffer
+// writes become visible, so reads are never declared.
+
+import std.mem
+import vk
+import ctx
+import res
+import sync
+import device
+import encoder
+
+fn tex(dev: device.Device, t: res.Texture) -> Result[res.TexInfo, str] {
+    guard t.dev == dev.id else {
+        return Err("texture {t.h.index} belongs to another device")
+    }
+    guard let Some(i) = dev.textures.get(t.h) else {
+        return Err("texture {t.h.index} was destroyed")
+    }
+    guard not i.dead else {
+        return Err("texture {t.h.index} was destroyed")
+    }
+    return Ok(i)
+}
+
+fn buf(dev: device.Device, b: res.Buffer) -> Result[res.BufInfo, str] {
+    guard b.dev == dev.id else {
+        return Err("buffer {b.h.index} belongs to another device")
+    }
+    guard let Some(i) = dev.buffers.get(b.h) else {
+        return Err("buffer {b.h.index} was destroyed")
+    }
+    guard not i.dead else {
+        return Err("buffer {b.h.index} was destroyed")
+    }
+    return Ok(i)
+}
+
+fn pipe(dev: device.Device, p: res.Pipeline) -> Result[res.PipeInfo, str] {
+    guard p.dev == dev.id else {
+        return Err("pipeline belongs to another device")
+    }
+    guard let Some(i) = dev.pipelines.get(p.h) else {
+        return Err("pipeline was destroyed")
+    }
+    guard not i.dead else {
+        return Err("pipeline was destroyed")
+    }
+    return Ok(i)
+}
+
+/// A texture a command may copy into or out of, or write as storage.
+fn plain(dev: device.Device, t: res.Texture, what: str) -> Result[res.TexInfo, str] {
+    let i = try tex(dev, t)
+    guard not i.ext and not i.sc else {
+        return Err("{what}: imported and swapchain textures cannot be used here")
+    }
+    return Ok(i)
+}
+
+fn range(b: res.Buffer, off: u64, len: u64, what: str) -> Result[(), str] {
+    guard off % 4 == 0 and off + len <= b.size else {
+        return Err("{what}: {len} bytes at {off} do not fit a {b.size}-byte buffer")
+    }
+    return Ok(())
+}
+
+fn check(dev: device.Device, e: encoder.Encoder) -> Result[(), str] {
+    guard e.dev == dev.id else {
+        return Err("encoder belongs to another device")
+    }
+    var color = vk.Format.UNDEFINED
+    var depth = vk.Format.UNDEFINED
+    var bound = false
+    for c in e.l.cmds {
+        match c {
+            Begin(p) => {
+                let t = try tex(dev, p.target)
+                guard (t.target or t.sc) and not res.is_depth(t.format) and not t.ext else {
+                    return Err("pass target {p.target.h.index} is not a color render target")
+                }
+                color = t.format
+                depth = vk.Format.UNDEFINED
+                if let Some(d) = p.depth {
+                    let di = try tex(dev, d)
+                    guard di.target and res.is_depth(di.format) and di.width == t.width and di.height == t.height else {
+                        return Err("pass depth {d.h.index} is not a depth target of the color target's size")
+                    }
+                    depth = di.format
+                }
+                bound = false
+            }
+            End => {
+                bound = false
+            }
+            BeginCompute => {
+                bound = false
+            }
+            EndCompute => {
+                bound = false
+            }
+            Bind(p) => {
+                let pi = try pipe(dev, p)
+                if pi.point == vk.PipelineBindPoint.GRAPHICS {
+                    guard pi.color == color and pi.depth == depth else {
+                        return Err("pipeline built for {pi.color} / {pi.depth} bound in a {color} / {depth} pass")
+                    }
+                } else if color != vk.Format.UNDEFINED {
+                    return Err("compute pipeline bound in a render pass")
+                }
+                bound = true
+            }
+            Push(off, len) => {
+                guard len <= ctx.push_size and len % 4 == 0 else {
+                    return Err("push constants must be a multiple of 4 bytes, at most {ctx.push_size}; got {len}")
+                }
+            }
+            Draw(v, n) => {
+                guard bound else {
+                    return Err("draw without a pipeline")
+                }
+            }
+            DrawIndexed(b, count, n) => {
+                guard bound else {
+                    return Err("draw without a pipeline")
+                }
+                discard try buf(dev, b)
+                try range(b, 0, u64(count) * 4, "draw_indexed")
+            }
+            DrawIndirect(b, off, count) => {
+                guard bound else {
+                    return Err("draw without a pipeline")
+                }
+                discard try buf(dev, b)
+                try range(b, off, u64(count) * 16, "draw_indirect")
+            }
+            Scissor(x, y, w, h) => {
+                guard x >= 0 and y >= 0 and int(x) + int(w) <= 2147483647 and int(y) + int(h) <= 2147483647 else {
+                    return Err("scissor {x},{y} {w}x{h} is out of range")
+                }
+            }
+            Dispatch(x, y, z) => {
+                guard bound else {
+                    return Err("dispatch without a pipeline")
+                }
+                guard x <= dev.max_groups[0] and y <= dev.max_groups[1] and z <= dev.max_groups[2] else {
+                    return Err("dispatch {x}x{y}x{z} exceeds the device's work group counts")
+                }
+            }
+            DispatchIndirect(b, off) => {
+                guard bound else {
+                    return Err("dispatch without a pipeline")
+                }
+                discard try buf(dev, b)
+                try range(b, off, 12, "dispatch_indirect")
+            }
+            ComputeBarrier => {}
+            Storage(t) => {
+                let i = try plain(dev, t, "storage")
+                guard i.storage else {
+                    return Err("texture {t.h.index} was not made with `storage`")
+                }
+            }
+            Copy(s, b, off, size) => {
+                discard try buf(dev, b)
+                guard off + size <= b.size else {
+                    return Err("copy past the end of a buffer")
+                }
+            }
+            Upload(s, t) => {
+                discard try plain(dev, t, "upload")
+            }
+            Download(t, b) => {
+                discard try plain(dev, t, "read back")
+                discard try buf(dev, b)
+                guard u64(t.width) * u64(t.height) * res.texel_size(t.format) <= b.size else {
+                    return Err("read back buffer too small")
+                }
+            }
+            Acquire(t) or Release(t) => {
+                guard (try tex(dev, t)).ext else {
+                    return Err("only imported textures are acquired and released")
+                }
+            }
+            Present(t) => {
+                guard (try tex(dev, t)).sc else {
+                    return Err("only swapchain images are presented")
+                }
+            }
+        }
+    }
+    return Ok(())
+}
+
+/// Translation state; its lists are borrowed from the device and given back.
+struct Rec {
+    cb: vk.CommandBuffer
+    t: ctx.Cmds
+    layout: vk.PipelineLayout
+    family: u32
+    foreign: u32
+    bars: List[vk.ImageMemoryBarrier2]
+    /// Textures to move to `Sampled` at the next flush.
+    publish: List[res.Texture]
+    /// Declared `storage` for the coming compute scope.
+    held: List[res.Texture]
+    /// Buffer writes not yet made visible.
+    src_stage: vk.PipelineStageFlags2 = vk.PipelineStageFlags2.NONE
+    src_access: vk.AccessFlags2 = vk.AccessFlags2.NONE
+}
+
+/// Move `t` into `u`, queueing a barrier when needed.
+fn Rec.use(mut self, mut dev: device.Device, t: res.Texture, u: sync.Use) {
+    let i = dev.textures.get(t.h).unwrap()
+    if sync.needs(i.state, u) {
+        self.bars.push(sync.barrier(i.image, i.aspect, i.state, u))
+    }
+    dev.set_state(t, u)
+    self.publish.retain(fn(p) => p.h != t.h)
+}
+
+fn Rec.publish(mut self, mut dev: device.Device, t: res.Texture) {
+    let i = dev.textures.get(t.h).unwrap()
+    if not i.sc and not self.publish.any(fn(p) => p.h == t.h) {
+        self.publish.push(t)
+    }
+}
+
+/// Emit queued barriers, pending publishes and pending buffer writes as
+/// one barrier command.
+fn Rec.flush(mut self, mut dev: device.Device) {
+    for k in 0..self.publish.len() {
+        let t = self.publish[k]
+        let i = dev.textures.get(t.h).unwrap()
+        if sync.needs(i.state, sync.Use.Sampled) {
+            self.bars.push(sync.barrier(i.image, i.aspect, i.state, sync.Use.Sampled))
+        }
+        dev.set_state(t, sync.Use.Sampled)
+    }
+    self.publish.clear()
+    let nmem: u32 = if self.src_stage.is_empty() { 0 } else { 1 }
+    guard nmem == 1 or not self.bars.is_empty() else {
+        return
+    }
+    let membar = vk.MemoryBarrier2 {
+        src_stage_mask: self.src_stage,
+        src_access_mask: self.src_access,
+        dst_stage_mask: vk.PipelineStageFlags2.ALL_COMMANDS | vk.PipelineStageFlags2.HOST,
+        dst_access_mask: vk.AccessFlags2.MEMORY_READ | vk.AccessFlags2.MEMORY_WRITE | vk.AccessFlags2.HOST_READ,
+    }
+    unsafe let dep = vk.DependencyInfo {
+        memory_barrier_count: nmem,
+        p_memory_barriers: Ptr.of(membar),
+        image_memory_barrier_count: u32(self.bars.len()),
+        p_image_memory_barriers: self.bars.as_ptr(),
+    }
+    unsafe self.t.barrier(self.cb, Ptr.of(dep))
+    self.bars.clear()
+    self.src_stage = vk.PipelineStageFlags2.NONE
+    self.src_access = vk.AccessFlags2.NONE
+}
+
+fn Rec.wrote_buffers(mut self, stage: vk.PipelineStageFlags2, access: vk.AccessFlags2) {
+    self.src_stage |= stage
+    self.src_access |= access
+}
+
+/// An ownership transfer of imported `i` between queue families.
+fn own(i: res.TexInfo, from: u32, to: u32, acquire: bool) -> vk.ImageMemoryBarrier2 {
+    let shaders = vk.PipelineStageFlags2.VERTEX_SHADER | vk.PipelineStageFlags2.FRAGMENT_SHADER | vk.PipelineStageFlags2.COMPUTE_SHADER
+    let read = vk.ImageLayout.SHADER_READ_ONLY_OPTIMAL
+    let general = vk.ImageLayout.GENERAL
+    return vk.ImageMemoryBarrier2 {
+        src_stage_mask: if acquire { vk.PipelineStageFlags2.NONE } else { shaders },
+        dst_stage_mask: if acquire { shaders } else { vk.PipelineStageFlags2.NONE },
+        dst_access_mask: if acquire { vk.AccessFlags2.SHADER_SAMPLED_READ } else { vk.AccessFlags2.NONE },
+        old_layout: if acquire { general } else { read },
+        new_layout: if acquire { read } else { general },
+        src_queue_family_index: from,
+        dst_queue_family_index: to,
+        image: i.image,
+        subresource_range: vk.ImageSubresourceRange { aspect_mask: i.aspect, level_count: 1, layer_count: 1 },
+    }
+}
+
+fn load_op(l: encoder.Load) -> vk.AttachmentLoadOp {
+    return match l {
+        Clear => vk.AttachmentLoadOp.CLEAR
+        Keep => vk.AttachmentLoadOp.LOAD
+        Discard => vk.AttachmentLoadOp.DONT_CARE
+    }
+}
+
+fn region(i: res.TexInfo, off: u64) -> vk.BufferImageCopy {
+    return vk.BufferImageCopy {
+        buffer_offset: off,
+        image_subresource: vk.ImageSubresourceLayers { aspect_mask: i.aspect, layer_count: 1 },
+        image_extent: vk.Extent3D { width: i.width, height: i.height, depth: 1 },
+    }
+}
+
+fn Rec.begin_pass(mut self, mut dev: device.Device, p: encoder.Pass) {
+    self.use(mut dev, p.target, sync.Use.Color)
+    if let Some(d) = p.depth {
+        self.use(mut dev, d, sync.Use.Depth)
+    }
+    self.flush(mut dev)
+    let ti = dev.textures.get(p.target.h).unwrap()
+    let color = vk.RenderingAttachmentInfo {
+        image_view: ti.view,
+        image_layout: vk.ImageLayout.COLOR_ATTACHMENT_OPTIMAL,
+        load_op: load_op(p.load),
+        store_op: vk.AttachmentStoreOp.STORE,
+        clear_value: vk.ClearValue { color: vk.ClearColorValue { float32: p.clear } },
+    }
+    var depth = vk.RenderingAttachmentInfo {}
+    if let Some(d) = p.depth {
+        depth = vk.RenderingAttachmentInfo {
+            image_view: dev.textures.get(d.h).unwrap().view,
+            image_layout: vk.ImageLayout.DEPTH_ATTACHMENT_OPTIMAL,
+            load_op: load_op(p.depth_load),
+            store_op: vk.AttachmentStoreOp.STORE,
+            clear_value: vk.ClearValue { depth_stencil: vk.ClearDepthStencilValue { depth: p.depth_clear } },
+        }
+    }
+    let area = vk.Rect2D { extent: vk.Extent2D { width: ti.width, height: ti.height } }
+    unsafe let info = vk.RenderingInfo {
+        render_area: area,
+        layer_count: 1,
+        color_attachment_count: 1,
+        p_color_attachments: Ptr.of(color),
+        p_depth_attachment: if p.depth.is_some() { Ptr.of(depth) } else { Ptr.null() },
+    }
+    let viewport = vk.Viewport { width: f32(ti.width), height: f32(ti.height), max_depth: 1.0 }
+    unsafe {
+        self.t.begin_rendering(self.cb, Ptr.of(info))
+        self.t.set_viewport(self.cb, 0, 1, Ptr.of(viewport))
+        self.t.set_scissor(self.cb, 0, 1, Ptr.of(area))
+    }
+}
+
+/// Record `e` into `cb` (already checked by `check`).
+fn translate(mut dev: device.Device, e: encoder.Encoder, cb: vk.CommandBuffer) -> Result[(), str] {
+    let cx = dev.cx
+    let info = vk.CommandBufferBeginInfo { flags: vk.CommandBufferUsageFlags.ONE_TIME_SUBMIT }
+    unsafe try ctx.ok(cx.cmd.begin(cb, Ptr.of(info)), "vkBeginCommandBuffer")
+    let set = cx.set
+    unsafe {
+        cx.cmd.bind_sets(cb, vk.PipelineBindPoint.GRAPHICS, cx.layout, 0, 1, Ptr.of(set), 0, Ptr.null())
+        cx.cmd.bind_sets(cb, vk.PipelineBindPoint.COMPUTE, cx.layout, 0, 1, Ptr.of(set), 0, Ptr.null())
+    }
+    var r = Rec { cb, t: cx.cmd, layout: cx.layout, family: cx.family, foreign: cx.foreign, bars: mem.replace(mut dev.bars, []), publish: [], held: [] }
+    // Textures made since the last submit become sampleable (undefined
+    // contents; transparent black is what a read most likely sees).
+    var fresh = mem.replace(mut dev.fresh, [])
+    for t in fresh {
+        if dev.textures.get(t.h).map(fn(i) => i.state == sync.Use.Undefined and not i.ext).unwrap_or(false) {
+            r.use(mut dev, t, sync.Use.Sampled)
+        }
+    }
+    fresh.clear()
+    dev.fresh = fresh
+    var pass: Option[encoder.Pass] = None
+    for c in e.l.cmds {
+        match c {
+            Begin(p) => {
+                r.begin_pass(mut dev, p)
+                pass = Some(p)
+            }
+            End => {
+                cx.cmd.end_rendering(cb)
+                // The pass's targets are readable from here on.
+                if let Some(p) = pass {
+                    r.publish(mut dev, p.target)
+                    if let Some(d) = p.depth {
+                        r.publish(mut dev, d)
+                    }
+                }
+                pass = None
+            }
+            BeginCompute => r.flush(mut dev)
+            EndCompute => {
+                for k in 0..r.held.len() {
+                    let t = r.held[k]
+                    r.publish.push(t)
+                }
+                r.held.clear()
+                r.wrote_buffers(vk.PipelineStageFlags2.COMPUTE_SHADER, vk.AccessFlags2.SHADER_WRITE)
+            }
+            Bind(p) => {
+                let pi = dev.pipelines.get(p.h).unwrap()
+                cx.cmd.bind_pipeline(cb, pi.point, pi.raw)
+            }
+            Push(off, len) => {
+                unsafe cx.cmd.push_constants(cb, cx.layout, ctx.push_stages(), 0, len, e.l.bytes.as_ptr().offset(int(off)))
+            }
+            Draw(v, n) => cx.cmd.draw(cb, v, n, 0, 0)
+            DrawIndexed(b, count, n) => {
+                cx.cmd.bind_index_buffer(cb, dev.buffers.get(b.h).unwrap().raw, 0, vk.IndexType.UINT32)
+                cx.cmd.draw_indexed(cb, count, n, 0, 0, 0)
+            }
+            DrawIndirect(b, off, count) => cx.cmd.draw_indirect(cb, dev.buffers.get(b.h).unwrap().raw, off, count, 16)
+            Scissor(x, y, w, h) => {
+                let rect = vk.Rect2D { offset: vk.Offset2D { x, y }, extent: vk.Extent2D { width: w, height: h } }
+                unsafe cx.cmd.set_scissor(cb, 0, 1, Ptr.of(rect))
+            }
+            Dispatch(x, y, z) => cx.cmd.dispatch(cb, x, y, z)
+            DispatchIndirect(b, off) => cx.cmd.dispatch_indirect(cb, dev.buffers.get(b.h).unwrap().raw, off)
+            ComputeBarrier => {
+                let membar = vk.MemoryBarrier2 {
+                    src_stage_mask: vk.PipelineStageFlags2.COMPUTE_SHADER,
+                    src_access_mask: vk.AccessFlags2.SHADER_WRITE,
+                    dst_stage_mask: vk.PipelineStageFlags2.COMPUTE_SHADER,
+                    dst_access_mask: vk.AccessFlags2.SHADER_READ | vk.AccessFlags2.SHADER_WRITE,
+                }
+                unsafe let dep = vk.DependencyInfo { memory_barrier_count: 1, p_memory_barriers: Ptr.of(membar) }
+                unsafe cx.cmd.barrier(cb, Ptr.of(dep))
+            }
+            Storage(t) => {
+                r.use(mut dev, t, sync.Use.Storage)
+                r.held.push(t)
+            }
+            Copy(s, b, off, size) => {
+                r.flush(mut dev)
+                let region = vk.BufferCopy { src_offset: s.offset, dst_offset: off, size }
+                unsafe cx.cmd.copy_buffer(cb, s.buffer, dev.buffers.get(b.h).unwrap().raw, 1, Ptr.of(region))
+                r.wrote_buffers(vk.PipelineStageFlags2.ALL_TRANSFER, vk.AccessFlags2.TRANSFER_WRITE)
+            }
+            Upload(s, t) => {
+                r.use(mut dev, t, sync.Use.CopyDst)
+                r.flush(mut dev)
+                let reg = region(dev.textures.get(t.h).unwrap(), s.offset)
+                let image = dev.textures.get(t.h).unwrap().image
+                unsafe cx.cmd.copy_buffer_to_image(cb, s.buffer, image, vk.ImageLayout.TRANSFER_DST_OPTIMAL, 1, Ptr.of(reg))
+                r.publish(mut dev, t)
+            }
+            Download(t, b) => {
+                r.use(mut dev, t, sync.Use.CopySrc)
+                r.flush(mut dev)
+                let reg = region(dev.textures.get(t.h).unwrap(), 0)
+                let image = dev.textures.get(t.h).unwrap().image
+                unsafe cx.cmd.copy_image_to_buffer(cb, image, vk.ImageLayout.TRANSFER_SRC_OPTIMAL, dev.buffers.get(b.h).unwrap().raw, 1, Ptr.of(reg))
+                r.publish(mut dev, t)
+                r.wrote_buffers(vk.PipelineStageFlags2.ALL_TRANSFER, vk.AccessFlags2.TRANSFER_WRITE)
+            }
+            Acquire(t) => r.bars.push(own(dev.textures.get(t.h).unwrap(), r.foreign, r.family, true))
+            Release(t) => r.bars.push(own(dev.textures.get(t.h).unwrap(), r.family, r.foreign, false))
+            Present(t) => r.use(mut dev, t, sync.Use.Present)
+        }
+    }
+    r.flush(mut dev)
+    dev.bars = mem.replace(mut r.bars, [])
+    return ctx.ok(cx.cmd.end(cb), "vkEndCommandBuffer")
+}

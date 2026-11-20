@@ -1,0 +1,11 @@
+[package]
+name = "triangle_gpu"
+version = "0.1.0"
+description = "The colored triangle on vk_gpu"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+vk_gpu = { path = "../../vk_gpu" }
+
+[build]
+libs = ["xcb"]

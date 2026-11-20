@@ -1,0 +1,186 @@
+// C registry names -> Mica names: `VkImageLayout` -> `ImageLayout`,
+// `pNext` -> `p_next`, `VK_IMAGE_LAYOUT_GENERAL` -> `GENERAL`,
+// `VK_UUID_SIZE` -> `uuid_size`.
+
+import std.str
+import std.encoding.hex
+
+fn is_upper(c: u8) -> bool {
+    return c >= 65 and c <= 90
+}
+
+fn is_lower(c: u8) -> bool {
+    return c >= 97 and c <= 122
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 and c <= 57
+}
+
+/// `0x1F`, `-12`, `7` -> the value.
+pub fn parse_int(s: str) -> Option[int] {
+    let t = s.trim()
+    if t.starts_with("-") {
+        return parse_int(t.slice(1, t.len())).map(fn(v) => 0 - v)
+    }
+    guard t.starts_with("0x") or t.starts_with("0X") else {
+        return t.to_int()
+    }
+    var v = 0
+    for b in t.slice(2, t.len()) {
+        let d = hex.digit(b)
+        guard d >= 0 else {
+            return None
+        }
+        v = v * 16 + d
+    }
+    return Some(v)
+}
+
+/// Words of a camel-case name: `PipelineStageFlags2` -> `PIPELINE STAGE FLAGS2`,
+/// `H264ProfileIdc` -> `H264 PROFILE IDC`, `deviceLUIDValid` -> `DEVICE LUID VALID`.
+pub fn words(s: str) -> List[str] {
+    var out: List[str] = []
+    var cur = ""
+    let n = s.len()
+    for i in 0..n {
+        let c = s[i]
+        if c == 95 {
+            if not cur.is_empty() {
+                out.push(take cur)
+                cur = ""
+            }
+            continue
+        }
+        if is_upper(c) and i > 0 and not cur.is_empty() {
+            let prev = s[i - 1]
+            let next: u8 = if i + 1 < n { s[i + 1] } else { 0 }
+            let split = is_lower(prev) or (is_digit(prev) and (is_lower(next) or is_upper(next))) or (is_upper(prev) and is_lower(next))
+            if split {
+                out.push(take cur)
+                cur = ""
+            }
+        }
+        cur += str.from_byte(c)
+    }
+    if not cur.is_empty() {
+        out.push(cur)
+    }
+    return out
+}
+
+/// A field, parameter or function name: `ppEnabledLayerNames` ->
+/// `pp_enabled_layer_names`; keywords become raw identifiers.
+pub fn snake(s: str) -> str {
+    return escape(str.join(words(s), "_").to_lower())
+}
+
+/// An item name that is a keyword becomes `r#name`.
+pub fn escape(s: str) -> str {
+    return match s {
+        "fn" or "let" or "var" or "struct" or "enum" or "trait" or "type" => "r#" + s
+        "extern" or "import" or "pub" or "test" or "if" or "else" or "guard" => "r#" + s
+        "match" or "while" or "for" or "in" or "return" or "break" or "continue" => "r#" + s
+        "try" or "and" or "or" or "not" or "true" or "false" or "mut" or "take" => "r#" + s
+        "self" or "unsafe" or "defer" or "discard" or "go" => "r#" + s
+        _ => s.clone()
+    }
+}
+
+/// `vkCreateInstance` -> `create_instance`.
+pub fn command(s: str) -> str {
+    return snake(s.strip_prefix("vk").unwrap_or(s.clone()))
+}
+
+/// `VK_MAX_EXTENSION_NAME_SIZE` -> `max_extension_name_size`.
+pub fn constant(s: str) -> str {
+    return escape(s.strip_prefix("VK_").unwrap_or(s.clone()).to_lower())
+}
+
+/// A type name: `VkImageLayout` -> `ImageLayout`, `wl_display` ->
+/// `WlDisplay`; a name that is built into Mica keeps its prefix (`VkResult`).
+pub fn type_name(s: str) -> str {
+    if s.starts_with("Vk") and s.len() > 2 and (is_upper(s[2]) or is_digit(s[2])) {
+        let t = s.slice(2, s.len())
+        return match t {
+            "Result" or "Option" or "List" or "Box" or "Ptr" => s.clone()
+            _ => t
+        }
+    }
+    guard s.len() > 0 and is_upper(s[0]) else {
+        var out = ""
+        for w in s.split("_") {
+            if not w.is_empty() {
+                out += w.slice(0, 1).to_upper() + w.slice(1, w.len())
+            }
+        }
+        return out
+    }
+    return s.clone()
+}
+
+/// `VK_KHR_swapchain` -> `KhrSwapchain`.
+pub fn extension(s: str) -> str {
+    var out = ""
+    for w in s.strip_prefix("VK_").unwrap_or(s.clone()).split("_") {
+        if not w.is_empty() {
+            out += w.slice(0, 1).to_upper() + w.slice(1, w.len()).to_lower()
+        }
+    }
+    return out
+}
+
+/// The vendor tag `name` ends with (`KHR` for `VkSurfaceKHR`), or "".
+pub fn tag_of(name: str, tags: List[str]) -> str {
+    for t in tags {
+        if name.ends_with(t) and name.len() > t.len() and not is_upper(name[name.len() - t.len() - 1]) {
+            return t.clone()
+        }
+    }
+    return ""
+}
+
+/// Variant name of enum value `value` in enum `ty`, ash style:
+/// `VK_IMAGE_LAYOUT_GENERAL` in `VkImageLayout` -> `GENERAL`,
+/// `VK_BUFFER_USAGE_TRANSFER_SRC_BIT` -> `TRANSFER_SRC`,
+/// `VK_PRESENT_MODE_FIFO_KHR` in `VkPresentModeKHR` -> `FIFO`,
+/// `VK_IMAGE_TYPE_2D` -> `TYPE_2D`.
+pub fn variant(ty: str, value: str, bitmask: bool, tags: List[str]) -> str {
+    let tag = tag_of(ty, tags)
+    var base = ty.slice(0, ty.len() - tag.len())
+    var suffix = ""
+    if let Some(i) = base.find("FlagBits") {
+        suffix = base.slice(i + 8, base.len())
+        base = base.slice(0, i)
+    }
+    var prefix = words(base).map(fn(w) => w.to_upper())
+    if not suffix.is_empty() {
+        prefix.push(suffix)
+    }
+    var rest = value.clone()
+    if not tag.is_empty() {
+        rest = rest.strip_suffix("_" + tag).unwrap_or(rest)
+    }
+    let vw = rest.split("_")
+    var k = 0
+    while k < prefix.len() and k < vw.len() - 1 and vw[k] == prefix[k] {
+        k += 1
+    }
+    var out = str.join(vw.slice(k, vw.len()), "_")
+    if bitmask {
+        if out.ends_with("_BIT") {
+            out = out.slice(0, out.len() - 4)
+        } else {
+            for t in tags {
+                if out.ends_with("_BIT_" + t) {
+                    out = out.slice(0, out.len() - t.len() - 5) + "_" + t
+                    break
+                }
+            }
+        }
+    }
+    if is_digit(out[0]) {
+        out = "TYPE_" + out
+    }
+    return out
+}

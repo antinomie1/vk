@@ -1,0 +1,62 @@
+// Image hazards. A texture is in one `Use` at a time; moving between two
+// uses that differ in layout, or where either writes, needs a barrier.
+// Reads are never declared: whatever writes a texture publishes it to
+// `Sampled` afterwards, so any shader may sample it by index.
+
+import vk
+
+enum Use derive(Show) {
+    Undefined
+    Color
+    Depth
+    Sampled
+    Storage
+    CopySrc
+    CopyDst
+    Present
+}
+
+struct Access {
+    layout: vk.ImageLayout
+    stage: vk.PipelineStageFlags2
+    access: vk.AccessFlags2
+    write: bool
+}
+
+fn Use.access(self) -> Access {
+    return match self {
+        Undefined => Access { layout: vk.ImageLayout.UNDEFINED, stage: vk.PipelineStageFlags2.ALL_COMMANDS, access: vk.AccessFlags2.NONE, write: false }
+        Color => Access { layout: vk.ImageLayout.COLOR_ATTACHMENT_OPTIMAL, stage: vk.PipelineStageFlags2.COLOR_ATTACHMENT_OUTPUT, access: vk.AccessFlags2.COLOR_ATTACHMENT_READ | vk.AccessFlags2.COLOR_ATTACHMENT_WRITE, write: true }
+        Depth => Access { layout: vk.ImageLayout.DEPTH_ATTACHMENT_OPTIMAL, stage: vk.PipelineStageFlags2.EARLY_FRAGMENT_TESTS | vk.PipelineStageFlags2.LATE_FRAGMENT_TESTS, access: vk.AccessFlags2.DEPTH_STENCIL_ATTACHMENT_READ | vk.AccessFlags2.DEPTH_STENCIL_ATTACHMENT_WRITE, write: true }
+        Sampled => Access { layout: vk.ImageLayout.SHADER_READ_ONLY_OPTIMAL, stage: vk.PipelineStageFlags2.VERTEX_SHADER | vk.PipelineStageFlags2.FRAGMENT_SHADER | vk.PipelineStageFlags2.COMPUTE_SHADER, access: vk.AccessFlags2.SHADER_SAMPLED_READ, write: false }
+        Storage => Access { layout: vk.ImageLayout.GENERAL, stage: vk.PipelineStageFlags2.FRAGMENT_SHADER | vk.PipelineStageFlags2.COMPUTE_SHADER, access: vk.AccessFlags2.SHADER_STORAGE_READ | vk.AccessFlags2.SHADER_STORAGE_WRITE, write: true }
+        CopySrc => Access { layout: vk.ImageLayout.TRANSFER_SRC_OPTIMAL, stage: vk.PipelineStageFlags2.ALL_TRANSFER, access: vk.AccessFlags2.TRANSFER_READ, write: false }
+        CopyDst => Access { layout: vk.ImageLayout.TRANSFER_DST_OPTIMAL, stage: vk.PipelineStageFlags2.ALL_TRANSFER, access: vk.AccessFlags2.TRANSFER_WRITE, write: true }
+        Present => Access { layout: vk.ImageLayout.PRESENT_SRC_KHR, stage: vk.PipelineStageFlags2.ALL_COMMANDS, access: vk.AccessFlags2.NONE, write: false }
+    }
+}
+
+fn needs(a: Use, b: Use) -> bool {
+    return a != b or a.access().write
+}
+
+fn barrier(image: vk.Image, aspect: vk.ImageAspectFlags, a: Use, b: Use) -> vk.ImageMemoryBarrier2 {
+    let x = a.access()
+    let y = b.access()
+    return vk.ImageMemoryBarrier2 {
+        src_stage_mask: x.stage,
+        src_access_mask: if x.write { x.access } else { vk.AccessFlags2.NONE },
+        dst_stage_mask: y.stage,
+        dst_access_mask: y.access,
+        old_layout: x.layout,
+        new_layout: y.layout,
+        src_queue_family_index: vk.queue_family_ignored,
+        dst_queue_family_index: vk.queue_family_ignored,
+        image,
+        subresource_range: vk.ImageSubresourceRange {
+            aspect_mask: aspect,
+            level_count: vk.remaining_mip_levels,
+            layer_count: vk.remaining_array_layers,
+        },
+    }
+}

@@ -1,0 +1,126 @@
+// Pipelines on the one bindless layout. Graphics pipelines target formats
+// (dynamic rendering, no render passes), take no vertex input (shaders
+// pull vertices through buffer addresses), and keep viewport and scissor
+// dynamic, so a resize never rebuilds them.
+
+import vk
+import ctx
+import res
+
+/// `Alpha` is premultiplied "over"; `Add` sums.
+pub enum Blend {
+    Opaque
+    Alpha
+    Add
+}
+
+pub enum Cull {
+    Off
+    Back
+    Front
+}
+
+pub struct Graphics {
+    /// Color target format; UNDEFINED for depth-only.
+    pub color: vk.Format = vk.Format.UNDEFINED
+    /// Depth target format; when set, depth is tested (less-or-equal) and written.
+    pub depth: vk.Format = vk.Format.UNDEFINED
+    pub blend: Blend = Blend.Opaque
+    pub cull: Cull = Cull.Off
+    pub topology: vk.PrimitiveTopology = vk.PrimitiveTopology.TRIANGLE_LIST
+}
+
+fn attachment(b: Blend) -> vk.PipelineColorBlendAttachmentState {
+    let rgba = vk.ColorComponentFlags.R | vk.ColorComponentFlags.G | vk.ColorComponentFlags.B | vk.ColorComponentFlags.A
+    let one = vk.BlendFactor.ONE
+    let dst = match b {
+        Opaque => vk.BlendFactor.ZERO
+        Alpha => vk.BlendFactor.ONE_MINUS_SRC_ALPHA
+        Add => vk.BlendFactor.ONE
+    }
+    return vk.PipelineColorBlendAttachmentState {
+        blend_enable: if b == Blend.Opaque { vk.r#false } else { vk.r#true },
+        src_color_blend_factor: one,
+        dst_color_blend_factor: dst,
+        color_blend_op: vk.BlendOp.ADD,
+        src_alpha_blend_factor: one,
+        dst_alpha_blend_factor: dst,
+        alpha_blend_op: vk.BlendOp.ADD,
+        color_write_mask: rgba,
+    }
+}
+
+fn graphics(cx: ctx.Ctx, d: Graphics, vs: str, fs: str) -> Result[vk.Pipeline, str] {
+    let vm = try res.module(cx, vs)
+    defer cx.fns.destroy_shader_module(cx.device, vm, Ptr.null())
+    let fm = try res.module(cx, fs)
+    defer cx.fns.destroy_shader_module(cx.device, fm, Ptr.null())
+    let entry = "main"
+    unsafe let stages: [2]vk.PipelineShaderStageCreateInfo = [
+        vk.PipelineShaderStageCreateInfo { stage: vk.ShaderStageFlags.VERTEX, module: vm, p_name: entry.as_cstr() },
+        vk.PipelineShaderStageCreateInfo { stage: vk.ShaderStageFlags.FRAGMENT, module: fm, p_name: entry.as_cstr() },
+    ]
+    let vertex_input = vk.PipelineVertexInputStateCreateInfo {}
+    let assembly = vk.PipelineInputAssemblyStateCreateInfo { topology: d.topology }
+    let viewport = vk.PipelineViewportStateCreateInfo { viewport_count: 1, scissor_count: 1 }
+    let cull = match d.cull {
+        Off => vk.CullModeFlags.NONE
+        Back => vk.CullModeFlags.BACK
+        Front => vk.CullModeFlags.FRONT
+    }
+    let raster = vk.PipelineRasterizationStateCreateInfo {
+        polygon_mode: vk.PolygonMode.FILL,
+        cull_mode: cull,
+        front_face: vk.FrontFace.COUNTER_CLOCKWISE,
+        line_width: 1.0,
+    }
+    let multisample = vk.PipelineMultisampleStateCreateInfo { rasterization_samples: vk.SampleCountFlags.TYPE_1 }
+    let has_depth = d.depth != vk.Format.UNDEFINED
+    let depth = vk.PipelineDepthStencilStateCreateInfo {
+        depth_test_enable: if has_depth { vk.r#true } else { vk.r#false },
+        depth_write_enable: if has_depth { vk.r#true } else { vk.r#false },
+        depth_compare_op: vk.CompareOp.LESS_OR_EQUAL,
+        max_depth_bounds: 1.0,
+    }
+    let ncolor: u32 = if d.color == vk.Format.UNDEFINED { 0 } else { 1 }
+    let blend_att = attachment(d.blend)
+    unsafe let blend = vk.PipelineColorBlendStateCreateInfo { attachment_count: ncolor, p_attachments: Ptr.of(blend_att) }
+    let dyn_states: [2]vk.DynamicState = [vk.DynamicState.VIEWPORT, vk.DynamicState.SCISSOR]
+    unsafe let dynamic = vk.PipelineDynamicStateCreateInfo { dynamic_state_count: 2, p_dynamic_states: Ptr.of(dyn_states).cast[vk.DynamicState]() }
+    let color_format = d.color
+    unsafe let rendering = vk.PipelineRenderingCreateInfo {
+        color_attachment_count: ncolor,
+        p_color_attachment_formats: Ptr.of(color_format),
+        depth_attachment_format: d.depth,
+    }
+    unsafe let info = vk.GraphicsPipelineCreateInfo {
+        p_next: Ptr.of(rendering).cast[u8](),
+        stage_count: 2,
+        p_stages: Ptr.of(stages).cast[vk.PipelineShaderStageCreateInfo](),
+        p_vertex_input_state: Ptr.of(vertex_input),
+        p_input_assembly_state: Ptr.of(assembly),
+        p_viewport_state: Ptr.of(viewport),
+        p_rasterization_state: Ptr.of(raster),
+        p_multisample_state: Ptr.of(multisample),
+        p_depth_stencil_state: Ptr.of(depth),
+        p_color_blend_state: Ptr.of(blend),
+        p_dynamic_state: Ptr.of(dynamic),
+        layout: cx.layout,
+    }
+    var out: List[vk.Pipeline] = [vk.Pipeline {}]
+    unsafe try ctx.ok(cx.fns.create_graphics_pipelines(cx.device, vk.PipelineCache {}, 1, Ptr.of(info), Ptr.null(), out), "vkCreateGraphicsPipelines")
+    return Ok(out[0])
+}
+
+fn compute(cx: ctx.Ctx, cs: str) -> Result[vk.Pipeline, str] {
+    let m = try res.module(cx, cs)
+    defer cx.fns.destroy_shader_module(cx.device, m, Ptr.null())
+    let entry = "main"
+    unsafe let info = vk.ComputePipelineCreateInfo {
+        stage: vk.PipelineShaderStageCreateInfo { stage: vk.ShaderStageFlags.COMPUTE, module: m, p_name: entry.as_cstr() },
+        layout: cx.layout,
+    }
+    var out: List[vk.Pipeline] = [vk.Pipeline {}]
+    unsafe try ctx.ok(cx.fns.create_compute_pipelines(cx.device, vk.PipelineCache {}, 1, Ptr.of(info), Ptr.null(), out), "vkCreateComputePipelines")
+    return Ok(out[0])
+}

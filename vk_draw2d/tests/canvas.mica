@@ -1,0 +1,128 @@
+// draw2d on the real device: shapes drawn into a 16x16 RGBA8 texture and
+// read back. Skipped without a Vulkan 1.3 driver.
+
+import vk_gpu as gpu
+import vk_draw2d as draw2d
+
+fn fx() -> Option[(gpu.Device, draw2d.Canvas, gpu.Texture)] {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return None
+    }
+    var dev = d
+    let canvas = draw2d.Canvas.create(mut dev, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    let tex = dev.texture(gpu.TextureDesc { width: 16, height: 16, target: true }).unwrap()
+    return Some((dev, canvas, tex))
+}
+
+/// Draw the canvas (cleared to black, or kept with `damage`) and read back.
+fn frame(mut dev: gpu.Device, mut c: draw2d.Canvas, tex: gpu.Texture, damage: Option[draw2d.Rect]) -> List[u8] {
+    var e = dev.encoder().unwrap()
+    let load = if damage.is_some() { gpu.Load.Keep } else { gpu.Load.Clear }
+    c.draw(mut dev, mut e, gpu.Pass { target: tex, load }, damage).unwrap()
+    discard dev.submit(take e).unwrap()
+    c.clear()
+    return dev.read_texture(tex).unwrap()
+}
+
+fn px(img: List[u8], x: int, y: int) -> (u8, u8, u8, u8) {
+    let i = (y * 16 + x) * 4
+    return (img[i], img[i + 1], img[i + 2], img[i + 3])
+}
+
+let black = (u8(0), u8(0), u8(0), u8(255))
+let red = (u8(255), u8(0), u8(0), u8(255))
+let blue = (u8(0), u8(0), u8(255), u8(255))
+
+fn full() -> draw2d.Rect {
+    return draw2d.Rect { w: 16.0, h: 16.0 }
+}
+
+test "rects, rounding and clips" {
+    guard let Some((d, c, tex)) = fx() else {
+        return
+    }
+    var dev = d
+    var canvas = c
+    canvas.rect(draw2d.Rect { w: 8.0, h: 16.0 }, vec4(1.0, 0.0, 0.0, 1.0))
+    var img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 2, 2), red)
+    assert_eq(px(img, 12, 2), black)
+
+    canvas.round_rect(full(), vec4(0.0, 0.0, 1.0, 1.0), 8.0)
+    img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 0, 0), black)
+    assert_eq(px(img, 8, 8), blue)
+    assert_eq(px(img, 8, 1), blue)
+
+    canvas.push_clip(draw2d.Rect { w: 4.0, h: 16.0 })
+    canvas.rect(full(), vec4(0.0, 0.0, 1.0, 1.0))
+    canvas.pop_clip()
+    img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 3, 9), blue)
+    assert_eq(px(img, 4, 9), black)
+
+    canvas.border(full(), vec4(1.0, 0.0, 0.0, 1.0), 0.0, 2.0)
+    img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 0, 5), red)
+    assert_eq(px(img, 1, 5), red)
+    assert_eq(px(img, 5, 5), black)
+}
+
+test "images, alpha and shadows" {
+    guard let Some((d, c, tex)) = fx() else {
+        return
+    }
+    var dev = d
+    var canvas = c
+    let src = dev.texture(gpu.TextureDesc { width: 2, height: 2 }).unwrap()
+    let texels: List[u8] = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+    var e = dev.encoder().unwrap()
+    dev.write_texture(mut e, src, texels).unwrap()
+    discard dev.submit(take e).unwrap()
+    canvas.image(src, full(), 1.0, 0.0)
+    var img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 1, 1), red)
+    assert_eq(px(img, 14, 1), (u8(0), u8(255), u8(0), u8(255)))
+    assert_eq(px(img, 1, 14), blue)
+
+    // Half-transparent red over black: premultiplied blending gives half red.
+    canvas.rect(full(), vec4(1.0, 0.0, 0.0, 0.5))
+    img = frame(mut dev, mut canvas, tex, None)
+    let (r, g, b, a) = px(img, 8, 8)
+    assert(r >= 126 and r <= 129 and g == 0 and b == 0)
+
+    // A shadow is dark at its center and fades out past the shape.
+    canvas.rect(full(), vec4(1.0, 1.0, 1.0, 1.0))
+    canvas.shadow(draw2d.Rect { x: 4.0, y: 4.0, w: 8.0, h: 8.0 }, vec4(0.0, 0.0, 0.0, 1.0), 0.0, 3.0)
+    img = frame(mut dev, mut canvas, tex, None)
+    assert(px(img, 8, 8).0 < 10)
+    assert(px(img, 0, 0).0 > 245)
+    let edge = px(img, 3, 8).0
+    assert(edge > 10 and edge < 245)
+}
+
+test "damage redraws only its region" {
+    guard let Some((d, c, tex)) = fx() else {
+        return
+    }
+    var dev = d
+    var canvas = c
+    canvas.rect(full(), vec4(1.0, 0.0, 0.0, 1.0))
+    discard frame(mut dev, mut canvas, tex, None)
+    canvas.rect(full(), vec4(0.0, 0.0, 1.0, 1.0))
+    let img = frame(mut dev, mut canvas, tex, Some(draw2d.Rect { x: 0.0, y: 0.0, w: 4.0, h: 4.0 }))
+    assert_eq(px(img, 1, 1), blue)
+    assert_eq(px(img, 3, 3), blue)
+    assert_eq(px(img, 4, 4), red)
+    assert_eq(px(img, 12, 12), red)
+    // Nothing reaches the damage: no pass is recorded, the image stays.
+    canvas.rect(draw2d.Rect { x: 10.0, y: 10.0, w: 2.0, h: 2.0 }, vec4(0.0, 1.0, 0.0, 1.0))
+    let same = frame(mut dev, mut canvas, tex, Some(draw2d.Rect { w: 4.0, h: 4.0 }))
+    assert_eq(px(same, 10, 10), red)
+}
+
+test "srgb converts to linear" {
+    let c = draw2d.srgb(1.0, 0.5, 0.0, 1.0)
+    assert(c.x == 1.0 and c.z == 0.0)
+    assert(c.y > 0.21 and c.y < 0.22)
+}
