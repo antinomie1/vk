@@ -1,0 +1,16 @@
+// C strings from GLFW as `str`.
+
+import std.str
+
+unsafe fn read(p: Ptr[u8]) -> str {
+    var bytes: List[u8] = []
+    guard not p.is_null() else {
+        return ""
+    }
+    var i = 0
+    while p.offset(i).read() != 0 {
+        bytes.push(p.offset(i).read())
+        i += 1
+    }
+    return str.from_bytes(bytes)
+}

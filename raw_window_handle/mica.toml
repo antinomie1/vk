@@ -1,0 +1,7 @@
+[package]
+name = "raw_window_handle"
+version = "0.1.0"
+description = "Native window handles shared by window and graphics libraries"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]

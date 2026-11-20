@@ -1,0 +1,47 @@
+// raw_window_handle: the native handles a window library hands to a graphics
+// library, so that neither depends on the other (as Rust's
+// raw-window-handle). Window libraries produce a `WindowHandle`; graphics
+// libraries read it. A handle is only data: the window it names must stay
+// open for as long as anything made from it (a Vulkan surface) is used.
+
+/// An X11 window through Xlib: `Display*` and the window's XID.
+pub unsafe struct Xlib {
+    pub display: Ptr[u8]
+    pub window: u64
+}
+
+/// An X11 window through XCB: `xcb_connection_t*` and the window id.
+pub unsafe struct Xcb {
+    pub connection: Ptr[u8]
+    pub window: u32
+}
+
+/// A Wayland surface: `wl_display*` and `wl_surface*`.
+pub unsafe struct Wayland {
+    pub display: Ptr[u8]
+    pub surface: Ptr[u8]
+}
+
+/// A Windows window: `HWND` and the `HINSTANCE` of the module that made it.
+pub unsafe struct Win32 {
+    pub hwnd: Ptr[u8]
+    pub hinstance: Ptr[u8]
+}
+
+/// A macOS window's content view: `NSView*` (main thread only).
+pub unsafe struct AppKit {
+    pub ns_view: Ptr[u8]
+}
+
+pub enum WindowHandle {
+    Xlib(Xlib)
+    Xcb(Xcb)
+    Wayland(Wayland)
+    Win32(Win32)
+    AppKit(AppKit)
+}
+
+/// What a window library's window provides.
+pub trait HasWindowHandle {
+    fn window_handle(self) -> WindowHandle
+}

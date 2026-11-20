@@ -1,0 +1,380 @@
+// Windows. GLFW is initialized with the first window and terminated when
+// the last one closes; every call happens on the thread that made the
+// window (a `Window` cannot be sent to another thread).
+
+import glfw_sys as sys
+import raw_window_handle as rwh
+import key
+import input
+import events
+import cstr
+import monitor
+
+extern fn get_error_text(mut description: Ptr[u8]) -> i32 = "glfwGetError"
+
+/// Never made; an `Option` of it keeps `Window` on its thread (extern types
+/// are not `Send`).
+extern struct ThreadBound
+
+// glfw3native.h, which `mica bind` does not generate.
+when os == "windows" {
+    extern fn get_win32_window(window: sys.Window) -> Ptr[u8] = "glfwGetWin32Window"
+    extern fn module_handle(name: Ptr[u16]) -> Ptr[u8] = "GetModuleHandleW"
+} else when os == "macos" {
+    extern fn get_cocoa_view(window: sys.Window) -> Ptr[u8] = "glfwGetCocoaView"
+} else {
+    extern fn get_x11_display() -> Ptr[u8] = "glfwGetX11Display"
+    extern fn get_x11_window(window: sys.Window) -> u64 = "glfwGetX11Window"
+    extern fn get_wayland_display() -> Ptr[u8] = "glfwGetWaylandDisplay"
+    extern fn get_wayland_window(window: sys.Window) -> Ptr[u8] = "glfwGetWaylandWindow"
+}
+
+/// Open windows.
+static var windows: int = 0
+
+/// GLFW's description of its last error.
+fn error(what: str) -> str {
+    var p: Ptr[u8] = Ptr.null()
+    let code = get_error_text(mut p)
+    unsafe {
+        return "{what}: {cstr.read(p)} (GLFW error {code:x})"
+    }
+}
+
+/// Initialize GLFW (a no-op when it is).
+fn init() -> Result[(), str] {
+    guard sys.init() == 1 else {
+        return Err(error("glfwInit"))
+    }
+    return Ok(())
+}
+
+fn release() {
+    unsafe {
+        windows -= 1
+        if windows == 0 {
+            sys.terminate()
+        }
+    }
+}
+
+fn flag(b: bool) -> i32 {
+    return if b { 1 } else { 0 }
+}
+
+pub struct WindowDesc {
+    pub title: str = "glfw"
+    pub width: u32 = 800
+    pub height: u32 = 600
+    pub resizable: bool = true
+    pub visible: bool = true
+    pub decorated: bool = true
+    pub focused: bool = true
+    /// Always on top.
+    pub floating: bool = false
+    pub maximized: bool = false
+    /// A framebuffer with alpha that the desktop composites.
+    pub transparent: bool = false
+    /// Grow with the monitor's content scale.
+    pub scale_to_monitor: bool = false
+    /// Fullscreen on this monitor (an index into `monitors()`) at its
+    /// current video mode.
+    pub fullscreen: Option[int] = None
+}
+
+pub struct Window {
+    w: sys.Window
+    cursor: sys.Cursor = 0
+    /// Not `Send`: GLFW windows belong to the thread that made them.
+    thread: Option[ThreadBound] = None
+}
+
+/// A `width` x `height` window titled `title`.
+pub fn Window.open(title: str, width: u32, height: u32) -> Result[Window, str] {
+    return Window.create(WindowDesc { title: title.clone(), width, height })
+}
+
+pub fn Window.create(d: WindowDesc) -> Result[Window, str] {
+    try init()
+    sys.default_window_hints()
+    sys.window_hint(sys.client_api, sys.no_api)
+    sys.window_hint(sys.resizable, flag(d.resizable))
+    sys.window_hint(sys.visible, flag(d.visible))
+    sys.window_hint(sys.decorated, flag(d.decorated))
+    sys.window_hint(sys.focused, flag(d.focused))
+    sys.window_hint(sys.floating, flag(d.floating))
+    sys.window_hint(sys.maximized, flag(d.maximized))
+    sys.window_hint(sys.transparent_framebuffer, flag(d.transparent))
+    sys.window_hint(sys.scale_to_monitor, flag(d.scale_to_monitor))
+    var mon: sys.Monitor = 0
+    var width = i32(d.width)
+    var height = i32(d.height)
+    if let Some(i) = d.fullscreen {
+        mon = try monitor.handle(i)
+        let mode = try monitor.current_mode(mon)
+        width = mode.width
+        height = mode.height
+    }
+    let w = sys.create_window(width, height, d.title, mon, 0)
+    guard w != 0 else {
+        return Err(error("glfwCreateWindow"))
+    }
+    unsafe {
+        windows += 1
+    }
+    events.install(w)
+    return Ok(Window { w })
+}
+
+/// Process pending events; false once the window was asked to close.
+pub fn Window.poll(mut self) -> bool {
+    sys.poll_events()
+    return not self.should_close()
+}
+
+/// Sleep until an event arrives or `seconds` pass, then process events.
+pub fn Window.wait(mut self, seconds: f64) -> bool {
+    sys.wait_events_timeout(seconds)
+    return not self.should_close()
+}
+
+/// The events since the last call, oldest first (`poll` or `wait` first).
+pub fn Window.events(mut self) -> List[input.Event] {
+    return events.drain(self.w)
+}
+
+pub fn Window.should_close(self) -> bool {
+    return sys.window_should_close(self.w) != 0
+}
+
+pub fn Window.set_should_close(mut self, close: bool) {
+    sys.set_window_should_close(self.w, flag(close))
+}
+
+/// Whether `k` is down.
+pub fn Window.key(self, k: key.Key) -> bool {
+    return k != key.Key.Unknown and sys.get_key(self.w, i32(k)) == sys.press
+}
+
+pub fn Window.mouse_button(self, b: input.MouseButton) -> bool {
+    return sys.get_mouse_button(self.w, i32(b)) == sys.press
+}
+
+pub fn Window.cursor_pos(self) -> (f64, f64) {
+    var x = 0.0
+    var y = 0.0
+    unsafe sys.get_cursor_pos(self.w, Ptr.of_mut(mut x), Ptr.of_mut(mut y))
+    return (x, y)
+}
+
+pub fn Window.set_cursor_pos(mut self, x: f64, y: f64) {
+    sys.set_cursor_pos(self.w, x, y)
+}
+
+pub fn Window.set_cursor_mode(mut self, m: input.CursorMode) {
+    sys.set_input_mode(self.w, i32(sys.cursor), input.cursor_mode(m))
+}
+
+/// Use the platform's `c` cursor over the window.
+pub fn Window.set_cursor(mut self, c: input.StandardCursor) {
+    let next = sys.create_standard_cursor(input.shape(c))
+    sys.set_cursor(self.w, next)
+    if self.cursor != 0 {
+        sys.destroy_cursor(self.cursor)
+    }
+    self.cursor = next
+}
+
+/// Unprocessed mouse motion while the cursor is `Disabled`, where supported.
+pub fn Window.set_raw_mouse_motion(mut self, on: bool) {
+    if sys.raw_mouse_motion_supported() != 0 {
+        sys.set_input_mode(self.w, i32(sys.raw_mouse_motion), flag(on))
+    }
+}
+
+pub fn Window.set_title(mut self, title: str) {
+    sys.set_window_title(self.w, title)
+}
+
+/// Size in screen coordinates.
+pub fn Window.size(self) -> (i32, i32) {
+    var w: i32 = 0
+    var h: i32 = 0
+    unsafe sys.get_window_size(self.w, Ptr.of_mut(mut w), Ptr.of_mut(mut h))
+    return (w, h)
+}
+
+pub fn Window.set_size(mut self, width: i32, height: i32) {
+    sys.set_window_size(self.w, max(width, 1), max(height, 1))
+}
+
+/// Size in pixels, what a swapchain needs; 0 x 0 while minimized.
+pub fn Window.framebuffer_size(self) -> (u32, u32) {
+    var w: i32 = 0
+    var h: i32 = 0
+    unsafe sys.get_framebuffer_size(self.w, Ptr.of_mut(mut w), Ptr.of_mut(mut h))
+    return (u32(max(w, 0)), u32(max(h, 0)))
+}
+
+pub fn Window.pos(self) -> (i32, i32) {
+    var x: i32 = 0
+    var y: i32 = 0
+    unsafe sys.get_window_pos(self.w, Ptr.of_mut(mut x), Ptr.of_mut(mut y))
+    return (x, y)
+}
+
+pub fn Window.set_pos(mut self, x: i32, y: i32) {
+    sys.set_window_pos(self.w, x, y)
+}
+
+/// Pixels per screen coordinate (2 on a Retina display).
+pub fn Window.content_scale(self) -> (f32, f32) {
+    var x: f32 = 1.0
+    var y: f32 = 1.0
+    unsafe sys.get_window_content_scale(self.w, Ptr.of_mut(mut x), Ptr.of_mut(mut y))
+    return (x, y)
+}
+
+/// Bounds for user resizing; `None` leaves that side free.
+pub fn Window.set_size_limits(mut self, smallest: Option[(i32, i32)], largest: Option[(i32, i32)]) {
+    let free = i32(sys.dont_care)
+    let (a, b) = smallest.unwrap_or((free, free))
+    let (c, d) = largest.unwrap_or((free, free))
+    sys.set_window_size_limits(self.w, a, b, c, d)
+}
+
+pub fn Window.set_aspect_ratio(mut self, numer: i32, denom: i32) {
+    if numer > 0 and denom > 0 {
+        sys.set_window_aspect_ratio(self.w, numer, denom)
+    }
+}
+
+pub fn Window.iconify(mut self) {
+    sys.iconify_window(self.w)
+}
+
+pub fn Window.restore(mut self) {
+    sys.restore_window(self.w)
+}
+
+pub fn Window.maximize(mut self) {
+    sys.maximize_window(self.w)
+}
+
+pub fn Window.show(mut self) {
+    sys.show_window(self.w)
+}
+
+pub fn Window.hide(mut self) {
+    sys.hide_window(self.w)
+}
+
+pub fn Window.focus(mut self) {
+    sys.focus_window(self.w)
+}
+
+pub fn Window.request_attention(mut self) {
+    sys.request_window_attention(self.w)
+}
+
+fn Window.attrib(self, a: int) -> bool {
+    return sys.get_window_attrib(self.w, i32(a)) != 0
+}
+
+pub fn Window.focused(self) -> bool {
+    return self.attrib(sys.focused)
+}
+
+pub fn Window.iconified(self) -> bool {
+    return self.attrib(sys.iconified)
+}
+
+pub fn Window.maximized(self) -> bool {
+    return self.attrib(sys.maximized)
+}
+
+pub fn Window.visible(self) -> bool {
+    return self.attrib(sys.visible)
+}
+
+/// The cursor is over the content area.
+pub fn Window.hovered(self) -> bool {
+    return self.attrib(sys.hovered)
+}
+
+pub fn Window.set_resizable(mut self, on: bool) {
+    sys.set_window_attrib(self.w, i32(sys.resizable), flag(on))
+}
+
+pub fn Window.set_decorated(mut self, on: bool) {
+    sys.set_window_attrib(self.w, i32(sys.decorated), flag(on))
+}
+
+pub fn Window.set_floating(mut self, on: bool) {
+    sys.set_window_attrib(self.w, i32(sys.floating), flag(on))
+}
+
+pub fn Window.opacity(self) -> f32 {
+    return sys.get_window_opacity(self.w)
+}
+
+pub fn Window.set_opacity(mut self, opacity: f32) {
+    sys.set_window_opacity(self.w, opacity.clamp(0.0, 1.0))
+}
+
+/// Fullscreen on monitor `index` (into `monitors()`) at its current mode.
+pub fn Window.set_fullscreen(mut self, index: int) -> Result[(), str] {
+    let m = try monitor.handle(index)
+    let mode = try monitor.current_mode(m)
+    sys.set_window_monitor(self.w, m, 0, 0, mode.width, mode.height, mode.refresh_rate)
+    return Ok(())
+}
+
+/// Back to a window at `x`, `y` of `width` x `height`.
+pub fn Window.set_windowed(mut self, x: i32, y: i32, width: i32, height: i32) {
+    sys.set_window_monitor(self.w, 0, x, y, max(width, 1), max(height, 1), 0)
+}
+
+/// The monitor it is fullscreen on (an index into `monitors()`).
+pub fn Window.monitor(self) -> Option[int] {
+    return monitor.index_of(sys.get_window_monitor(self.w))
+}
+
+pub fn Window.clipboard(self) -> str {
+    return sys.get_clipboard_string(self.w).unwrap_or("")
+}
+
+pub fn Window.set_clipboard(mut self, text: str) {
+    sys.set_clipboard_string(self.w, text)
+}
+
+/// The GLFW window, for the rest of `glfw_sys`.
+pub fn Window.raw(self) -> sys.Window {
+    return self.w
+}
+
+/// The native handle a graphics library makes its surface from: Win32,
+/// AppKit, Wayland, or Xlib on X11.
+pub fn Window.window_handle(self) -> rwh.WindowHandle {
+    when os == "windows" {
+        return rwh.WindowHandle.Win32(rwh.Win32 { hwnd: get_win32_window(self.w), hinstance: module_handle(Ptr.null()) })
+    } else {
+        when os == "macos" {
+            return rwh.WindowHandle.AppKit(rwh.AppKit { ns_view: get_cocoa_view(self.w) })
+        } else {
+            if sys.get_platform() == sys.platform_wayland {
+                return rwh.WindowHandle.Wayland(rwh.Wayland { display: get_wayland_display(), surface: get_wayland_window(self.w) })
+            }
+            return rwh.WindowHandle.Xlib(rwh.Xlib { display: get_x11_display(), window: get_x11_window(self.w) })
+        }
+    }
+}
+
+fn Window.drop(mut self) {
+    if self.cursor != 0 {
+        sys.destroy_cursor(self.cursor)
+    }
+    events.forget(self.w)
+    sys.destroy_window(self.w)
+    release()
+}

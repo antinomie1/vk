@@ -1,2 +1,2 @@
 [workspace]
-members = ["vk", "vk_gpu", "vk_draw2d", "vk_compose", "vk_graph", "generator", "examples/*"]
+members = ["vk", "vk_gpu", "vk_window", "raw_window_handle", "glfw_sys", "glfw", "vk_draw2d", "vk_compose", "vk_graph", "generator", "examples/*"]

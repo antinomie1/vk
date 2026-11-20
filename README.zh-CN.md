@@ -12,8 +12,12 @@
 | `vk_draw2d` | 基于 `vk_gpu` 的批量 2D：圆角矩形、边框、阴影、图片、裁剪、局部重绘 |
 | `vk_compose` | 合成器的一帧：纹理与 dmabuf 上的视图，按缓冲年龄计算损坏区域 |
 | `vk_graph` | 基于 `vk_gpu` 的渲染图：pass 剔除，临时纹理池化 |
+| `vk_window` | 根据原始窗口句柄创建 Vulkan surface（类似 ash-window） |
+| `raw_window_handle` | 窗口库与图形库共用的原生窗口句柄约定 |
+| `glfw_sys` | 由 `glfw3.h` 生成的 GLFW 3.4+ 绑定 |
+| `glfw` | 基于 `glfw_sys` 的安全 GLFW 窗口，产出原始窗口句柄 |
 | `generator` | 从注册表生成 `vk/src/lib.mica` 及其布局测试 |
-| `examples/triangle` | XCB 窗口（X11 或 XWayland）中的彩色三角形，直接用 `vk` |
+| `examples/triangle` | GLFW 窗口（X11 或 Wayland）中的彩色三角形，直接用 `vk` |
 | `examples/triangle_gpu` | 同一个三角形，用 `vk_gpu` |
 
 ## vk
@@ -141,7 +145,7 @@ out.destroy(mut dev)
 ## vk_draw2d
 
 `Canvas`：`rect`、`round_rect`、`border`、`shadow`、`image`、`image_part`
-（图集、字形）、`push_clip` / `pop_clip`，然后 `draw(dev, e, pass, damage)`。
+（图集中的精灵）、`push_clip` / `pop_clip`，然后 `draw(dev, e, pass, damage)`。
 
 - 每个目标一次实例化绘制：形状是 80 字节的实例，放进上传环，按缓冲地址读取；
   纹理按 bindless 下标读取。
@@ -150,7 +154,7 @@ out.destroy(mut dev)
 - 传入损坏区域时 pass 被裁剪，区域外的形状被跳过；没有形状落入时不录制 pass。
 - 预乘 alpha 混合；颜色用非预乘 alpha，sRGB 目标用 `srgb()`。
 
-尚未实现：文字排版与光栅化（可用 `image_part` 从自己的图集画字形）、背景模糊。
+尚未实现：背景模糊。
 
 ## vk_compose
 
@@ -176,6 +180,60 @@ gpu.Compute) ...))`、`run(dev, e, outputs)`。
 - 描述相同的临时纹理下一帧从池中取回，连续 3 帧不用就释放：稳态帧不分配显存
   （装箱的 pass 闭包是很小的堆分配）。
 
+## 窗口层
+
+按 Rust 的方式分层，窗口库和图形库互不依赖：
+
+| Bundle | Rust 对应 | 作用 |
+|---|---|---|
+| `glfw_sys` | glfw-sys | 完整的 GLFW API，由 `mica bind` 生成；句柄是 `u64`，`0` 表示 NULL |
+| `glfw` | glfw | 安全的窗口、输入、显示器、手柄（见下） |
+| `raw_window_handle` | raw-window-handle | `WindowHandle`：`Xlib`、`Xcb`、`Wayland`、`Win32` 或 `AppKit`，以及 `HasWindowHandle` trait |
+| `vk_window` | ash-window | `extensions(handle)` 给出实例扩展，`create_surface(st, instance, handle)` 创建 surface（macOS 下给 view 挂上 `CAMetalLayer`） |
+
+`vk_gpu.Surface.create` 接收 `WindowHandle`；直接用 `vk` 的程序直接用
+`vk_window`。句柄只是数据：在销毁它的 surface 之前不要关闭窗口。
+
+`glfw`（只需 `import glfw`）：
+
+- `Window.open(title, w, h)` 或 `Window.create(WindowDesc { ... })`：可调整
+  大小、可见、有边框、聚焦、置顶、最大化、透明、随显示器缩放、在某个显示器上
+  全屏。不带 GL 上下文。GLFW 从第一个窗口打开存活到最后一个关闭。
+- 事件：`poll()` / `wait(seconds)`（窗口要关闭时返回 false），然后 `events()`
+  取出该窗口的 `Event`，按时间先后：`Key(Key, scancode, Action, Mods)`、
+  `Char`、`MouseButton`、`CursorPos`、`CursorEnter`、`Scroll`、`Pos`、`Size`、
+  `FramebufferSize`、`ContentScale`、`Close`、`Refresh`、`Focus`、`Iconify`、
+  `Maximize`、`FileDrop`。一个窗口最多积压 4096 个未读事件。
+- 输入状态：`key(Key)`、`mouse_button(MouseButton)`、`cursor_pos`；
+  `set_cursor_mode`（正常、隐藏、禁用、限制在窗口内）、`set_cursor`（标准形状）、
+  `set_raw_mouse_motion`。
+- 几何与状态：标题、大小、位置、帧缓冲大小、内容缩放、大小限制、宽高比、
+  最小化 / 还原 / 最大化 / 显示 / 隐藏 / 聚焦 / 请求注意、不透明度、可调整大小 /
+  边框 / 置顶；`set_fullscreen(monitor)` / `set_windowed(...)` / `monitor()`。
+- `clipboard()` / `set_clipboard`；`glfw.monitors()`（名称、位置、工作区、物理
+  尺寸、缩放、当前与全部视频模式）、`glfw.joysticks()`、`glfw.gamepad(j)`
+  （按钮、摇杆）、`glfw.time()`。
+- `window_handle()`：Windows 下是 Win32，macOS 下是 AppKit，Linux 下是
+  Wayland 或 Xlib。其余功能用 `raw()` 拿到 `glfw_sys` 的窗口。
+- 显示器和手柄都是快照（显示器断开时 GLFW 会释放它），`Window` 不是 `Send`：
+  GLFW 只在一个线程上运行（macOS 下必须是主线程）。
+
+会话支持 Wayland 时 GLFW 使用 Wayland（取消 `WAYLAND_DISPLAY` 则用 X11）；
+Wayland 交换链从不报告 out-of-date，要跟随 `framebuffer_size()` 重建。
+
+## 平台
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| 窗口层、示例 | 已运行并测试（X11、Wayland） | 已做类型检查并编译为目标文件 | 已做类型检查并编译为目标文件（arm64、x86_64） |
+| GLFW 库 | `libglfw` | `glfw3`（静态，链接 `gdi32` `user32` `shell32`） | `libglfw`（Homebrew：`LIBRARY_PATH=/opt/homebrew/lib`） |
+| Surface | Xlib、XCB、Wayland | Win32 | Metal（`VK_EXT_metal_surface`） |
+| Vulkan | 任意 1.3 驱动 | 任意 1.3 驱动 | MoltenVK；有 portability enumeration 和 `VK_KHR_portability_subset` 时自动开启 |
+
+`vk_gpu` 在所有平台都需要 Vulkan 1.3 驱动；dmabuf 与 sync_file 共享只在 Linux
+上可用（其他平台返回 `Err`）。Windows 与 macOS 用 `mica emit-llvm --target
+<triple>` 和 `clang -c` 检查过，但没有实际运行。
+
 ## 三角形示例
 
 ```sh
@@ -183,7 +241,7 @@ sheaf run -p triangle          # 直到关闭窗口或按 Escape
 sheaf run -p triangle -- 300   # 画 300 帧后退出
 ```
 
-需要 `libxcb`。一帧在飞，视口和裁剪是动态的，窗口大小变化时重建交换链。shader
+需要 GLFW 3.4+。一帧在飞，视口和裁剪是动态的，窗口大小变化时重建交换链。shader
 从 `shaders/*.spv` 嵌入；修改 GLSL 后重新编译：
 
 ```sh
@@ -203,6 +261,10 @@ sheaf run -p generator -- /usr/share/vulkan/registry vk
 `registry/`。生成器写出 `vk/src/lib.mica`，以及 `vk/tests/layout.c` 和
 `vk/tests/layout.mica`。
 
+```sh
+cd glfw_sys/src && mica bind /usr/include/GLFW/glfw3.h -D GLFW_INCLUDE_NONE --handles u64 -o lib.mica
+```
+
 ## 测试
 
 ```sh
@@ -213,6 +275,10 @@ sheaf test -p vk_gpu      # 在真实设备上无头运行：清屏、绘制、b
 sheaf test -p vk_draw2d   # 形状、裁剪、透明、阴影、损坏区域，读回比对
 sheaf test -p vk_compose  # 移动、空闲帧、层叠、导入 dmabuf 的窗口
 sheaf test -p vk_graph    # 剔除、顺序、池化
+sheaf test -p glfw_sys    # 生成的 API 对真实库的调用
+sheaf test -p glfw        # 窗口及其句柄
+sheaf test -p vk_window   # 扩展，以及为真实窗口创建 surface
+                          # （窗口测试在没有显示服务器时跳过）
 cd vk_draw2d/shaders && for f in *.vert *.frag; do glslc --target-env=vulkan1.3 -I ../../vk_gpu/shaders $f -o $f.spv; done
 cd vk_gpu/tests/shaders && for f in *.vert *.frag *.comp; do glslc --target-env=vulkan1.3 -I ../../shaders $f -o $f.spv; done
 sheaf test -p vk    # 取值、派生，以及有驱动时创建真实的实例和设备

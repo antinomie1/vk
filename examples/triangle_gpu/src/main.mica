@@ -1,12 +1,13 @@
-// triangle_gpu [frames]: the triangle example on vk_gpu. A device, a
-// surface and one pipeline; the frame loop is acquire, record, present.
+// triangle_gpu [frames]: the triangle example on vk_gpu in a GLFW window
+// (X11 or Wayland). A device, a surface and one pipeline; the frame loop is
+// acquire, record, present.
 // Swapchain rebuilds, semaphores, layouts and barriers happen inside.
 
 import std.io
 import std.env
 import std.time
 import vk_gpu as gpu
-import xcb
+import glfw
 
 fn main() -> int {
     let args = env.args()
@@ -24,14 +25,16 @@ fn main() -> int {
 }
 
 fn run(frames: int) -> Result[int, str] {
-    var win = try xcb.open("vk_gpu triangle", 800, 600)
+    var win = try glfw.Window.open("vk_gpu triangle", 800, 600)
     var dev = try gpu.Device.open(gpu.Options { app_name: "triangle_gpu" })
-    unsafe let native = gpu.Native.xcb(win.connection(), win.id)
-    var out = try gpu.Surface.create(mut dev, native, win.width, win.height, true)
+    let (w, h) = win.framebuffer_size()
+    var out = try gpu.Surface.create(mut dev, win.window_handle(), w, h, true)
     let tri = try dev.graphics(gpu.Graphics { color: out.format() }, embed("../shaders/triangle.vert.spv"), embed("../shaders/triangle.frag.spv"))
 
     var drawn = 0
-    while win.poll() and (frames == 0 or drawn < frames) {
+    while win.poll() and not win.key(glfw.Key.Escape) and (frames == 0 or drawn < frames) {
+        let (fw, fh) = win.framebuffer_size()
+        out.resize(fw, fh)
         guard let Some(f) = try out.acquire(mut dev) else {
             time.sleep_ms(16)
             continue

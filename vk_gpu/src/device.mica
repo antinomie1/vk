@@ -121,7 +121,7 @@ pub fn Device.open(o: Options) -> Result[Device, str] {
         cx,
         id: u64(cx.device.raw),
         max_groups: base.max_groups,
-        wsi: base.wsi,
+        wsi: base.wsi.clone(),
         ext: base.ext,
         bl: base.bl,
         max_textures: base.max_textures,
@@ -193,7 +193,7 @@ fn Device.placeholders(mut self) -> Result[(), str] {
 pub fn Device.done(mut self, t: res.Ticket) -> bool {
     if t.value > self.completed {
         var v: u64 = 0
-        discard self.cx.v12.get_semaphore_counter_value(self.cx.device, self.timeline, mut v)
+        discard self.cx.fns.get_semaphore_counter_value(self.cx.device, self.timeline, mut v)
         self.completed = v
     }
     return t.value <= self.completed
@@ -205,7 +205,7 @@ pub fn Device.wait(mut self, t: res.Ticket) -> Result[(), str] {
         return Ok(())
     }
     unsafe let info = vk.SemaphoreWaitInfo { semaphore_count: 1, p_semaphores: Ptr.of(self.timeline), p_values: Ptr.of(t.value) }
-    unsafe try ctx.ok(self.cx.v12.wait_semaphores(self.cx.device, Ptr.of(info), ~u64(0)), "vkWaitSemaphores")
+    unsafe try ctx.ok(self.cx.fns.wait_semaphores(self.cx.device, Ptr.of(info), ~u64(0)), "vkWaitSemaphores")
     self.completed = max(self.completed, t.value)
     self.collect()
     return Ok(())
@@ -412,7 +412,7 @@ fn Device.submit_raw(mut self, cb: vk.CommandBuffer, wait: vk.Semaphore, signal:
         signal_semaphore_info_count: u32(self.signal_infos.len()),
         p_signal_semaphore_infos: self.signal_infos.as_ptr(),
     }
-    unsafe let r = self.cx.v13.queue_submit2(self.cx.queue, 1, Ptr.of(info), vk.Fence {})
+    unsafe let r = self.cx.fns.queue_submit2(self.cx.queue, 1, Ptr.of(info), vk.Fence {})
     try ctx.ok(r, "vkQueueSubmit2")
     self.submitted = value
     self.retire.push_back(Retired { at: value, g: Garbage.Cmd(cb) })
@@ -691,7 +691,7 @@ pub fn Device.write_texture(mut self, mut e: encoder.Encoder, t: res.Texture, da
     }
     let need = u64(i.width) * u64(i.height) * res.texel_size(i.format)
     guard need > 0 and u64(data.len()) == need else {
-        return Err("texture {i.width}x{i.height} {i.format} needs {need} bytes, got {data.len()}")
+        return Err("texture {i.width}x{i.height} of format {i32(i.format)} needs {need} bytes, got {data.len()}")
     }
     let s = try self.stage(data)
     e.push_cmd(encoder.Cmd.Upload(s, t))
@@ -721,7 +721,7 @@ pub fn Device.read_texture(mut self, t: res.Texture) -> Result[List[u8], str] {
     let i = try self.tex(t)
     let n = u64(i.width) * u64(i.height) * res.texel_size(i.format)
     guard n > 0 else {
-        return Err("cannot read back {i.format}")
+        return Err("cannot read back format {i32(i.format)}")
     }
     let b = try self.buffer(n, alloc.Mem.Readback)
     var e = try self.encoder()

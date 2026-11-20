@@ -1,0 +1,113 @@
+// The safe layer on a real window: events, input, geometry, cursor,
+// clipboard, monitors, its native handle. Skipped without a display (no
+// X11 or Wayland server).
+
+import glfw
+import raw_window_handle as rwh
+
+test "window, events and handle" {
+    guard let Ok(w) = glfw.Window.create(glfw.WindowDesc { title: "glfw test", width: 64, height: 48, resizable: false }) else {
+        return
+    }
+    var win = w
+    assert(win.poll())
+    let (fw, fh) = win.framebuffer_size()
+    assert(fw > 0 and fh > 0)
+    assert(not win.key(glfw.Key.Escape))
+    assert(not win.key(glfw.Key.Unknown))
+    assert(not win.mouse_button(glfw.MouseButton.Left))
+    win.set_title("renamed")
+    win.set_cursor(glfw.StandardCursor.Crosshair)
+    win.set_cursor(glfw.StandardCursor.Arrow)
+    win.set_cursor_mode(glfw.CursorMode.Hidden)
+    win.set_cursor_mode(glfw.CursorMode.Normal)
+    win.set_size_limits(Some((32, 32)), None)
+    discard win.events()
+    win.set_should_close(true)
+    assert(not win.poll())
+    let found = win.events().any(fn(e) => match e {
+        Close => true
+        _ => false
+    })
+    assert(not found)
+    match win.window_handle() {
+        Xlib(x) => assert(not x.display.is_null() and x.window != 0)
+        Wayland(wl) => assert(not wl.display.is_null() and not wl.surface.is_null())
+        _ => panic("Linux gives Xlib or Wayland handles")
+    }
+    assert(glfw.time() > 0.0)
+    let (sx, sy) = win.content_scale()
+    assert(sx > 0.0 and sy > 0.0)
+}
+
+test "monitors and gamepads are snapshots" {
+    guard let Ok(w) = glfw.Window.open("monitors", 32, 32) else {
+        return
+    }
+    let win = w
+    let ms = glfw.monitors()
+    for m in ms {
+        assert(m.mode.width > 0 and m.mode.height > 0)
+        assert(not m.modes.is_empty())
+    }
+    if not ms.is_empty() {
+        assert(ms[0].primary)
+    }
+    assert(win.monitor().is_none())
+    for j in glfw.joysticks() {
+        assert(j >= 0 and j < 16)
+    }
+    assert(glfw.gamepad(99).is_none())
+}
+
+test "keys keep GLFW's values" {
+    assert_eq(i32(glfw.Key.Escape), 256)
+    assert_eq(i32(glfw.Key.A), 65)
+    assert_eq(i32(glfw.Key.Num0), 48)
+    assert_eq(i32(glfw.Key.Kp9), 329)
+    assert_eq(i32(glfw.Key.Menu), 348)
+    assert_eq(glfw.Key.from(65), Some(glfw.Key.A))
+    assert((glfw.Mods.SHIFT | glfw.Mods.CONTROL).contains(glfw.Mods.SHIFT))
+}
+
+test "windows open again after the last one closed" {
+    for _ in 0..2 {
+        guard let Ok(w) = glfw.Window.open("again", 32, 32) else {
+            return
+        }
+        var win = w
+        assert(win.poll())
+    }
+}
+
+test "callbacks reach the window's queue" {
+    guard let Ok(w) = glfw.Window.open("events", 64, 64) else {
+        return
+    }
+    var win = w
+    // A Wayland compositor decides window sizes and may ignore the request.
+    let wayland = match win.window_handle() {
+        Wayland => true
+        _ => false
+    }
+    guard not wayland else {
+        return
+    }
+    discard win.poll()
+    discard win.events()
+    win.set_size(96, 80)
+    var resized = false
+    for _ in 0..40 {
+        discard win.wait(0.05)
+        for e in win.events() {
+            match e {
+                Size(width, height) => resized = resized or (width == 96 and height == 80)
+                _ => {}
+            }
+        }
+        if resized {
+            break
+        }
+    }
+    assert(resized)
+}

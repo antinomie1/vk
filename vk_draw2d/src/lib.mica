@@ -96,7 +96,7 @@ pub fn Canvas.image(mut self, t: gpu.Texture, r: Rect, opacity: f32, radius: f32
 }
 
 /// Part `uv` (0..1) of texture `t` over `r`, multiplied by `tint`: atlas
-/// sprites and glyphs.
+/// sprites.
 pub fn Canvas.image_part(mut self, t: gpu.Texture, r: Rect, uv: Rect, tint: vec4) {
     self.add(r, tint, 0.0, 0.0, 0.0, t.index(), vec4(uv.x, uv.y, uv.x + uv.w, uv.y + uv.h))
 }

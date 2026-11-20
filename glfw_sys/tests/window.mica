@@ -1,0 +1,34 @@
+// The generated API against the real library: a window without a GL
+// context, its framebuffer, events and the Vulkan instance extensions.
+// Skipped without a display (no X11 or Wayland server).
+
+import glfw_sys as glfw
+
+test "a window through the generated API" {
+    guard glfw.init() == 1 else {
+        return
+    }
+    defer glfw.terminate()
+    glfw.window_hint(glfw.client_api, glfw.no_api)
+    let w = glfw.create_window(64, 48, "glfw test", 0, 0)
+    guard w != 0 else {
+        return
+    }
+    defer glfw.destroy_window(w)
+    glfw.poll_events()
+    assert_eq(glfw.window_should_close(w), 0)
+    var fw: i32 = 0
+    var fh: i32 = 0
+    unsafe glfw.get_framebuffer_size(w, Ptr.of_mut(mut fw), Ptr.of_mut(mut fh))
+    assert(fw > 0 and fh > 0)
+    assert(glfw.get_key(w, glfw.key_escape) != glfw.press)
+    let p = glfw.get_platform()
+    assert(p == glfw.platform_x11 or p == glfw.platform_wayland)
+    assert_eq(glfw.vulkan_supported(), 1)
+    var n: u32 = 0
+    unsafe {
+        let names = glfw.get_required_instance_extensions(Ptr.of_mut(mut n))
+        assert(not names.is_null())
+    }
+    assert(n >= 2)
+}

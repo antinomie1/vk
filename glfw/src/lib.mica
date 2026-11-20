@@ -1,0 +1,43 @@
+// glfw: safe GLFW on the generated `glfw_sys` (as Rust's glfw over
+// glfw-sys): windows without a GL context, their events and input,
+// monitors, gamepads, the clipboard and the timer. A window hands its native
+// handle to a graphics library as a `raw_window_handle.WindowHandle`, on
+// Windows, macOS, Wayland and X11. Use only from the thread that opened the
+// first window (the main thread on macOS).
+
+pub import window
+pub import input
+pub import key
+pub import monitor
+pub import joystick
+
+pub type Window = window.Window
+pub type WindowDesc = window.WindowDesc
+pub type Event = input.Event
+pub type Key = key.Key
+pub type Action = input.Action
+pub type Mods = input.Mods
+pub type MouseButton = input.MouseButton
+pub type CursorMode = input.CursorMode
+pub type StandardCursor = input.StandardCursor
+pub type Monitor = monitor.Monitor
+pub type VideoMode = monitor.VideoMode
+pub type Gamepad = joystick.Gamepad
+pub type GamepadButton = joystick.GamepadButton
+pub type GamepadAxis = joystick.GamepadAxis
+
+pub fn monitors() -> List[monitor.Monitor] {
+    return monitor.monitors()
+}
+
+pub fn joysticks() -> List[int] {
+    return joystick.joysticks()
+}
+
+pub fn gamepad(j: int) -> Option[joystick.Gamepad] {
+    return joystick.gamepad(j)
+}
+
+pub fn time() -> f64 {
+    return joystick.time()
+}

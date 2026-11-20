@@ -1,0 +1,14 @@
+[package]
+name = "glfw_sys"
+version = "0.1.0"
+description = "GLFW 3.4+ bindings generated from glfw3.h by mica bind"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+
+# The library's name differs per platform.
+[target.'os == "windows"'.dependencies]
+glfw_link = { path = "link/windows" }
+
+[target.'os != "windows"'.dependencies]
+glfw_link = { path = "link/unix" }

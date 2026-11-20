@@ -1,0 +1,87 @@
+// Joysticks and gamepads (SDL_GameControllerDB mappings), read as
+// snapshots, and the timer.
+
+import glfw_sys as sys
+import window
+
+pub enum GamepadButton: i32 derive(Show) {
+    A = 0
+    B = 1
+    X = 2
+    Y = 3
+    LeftBumper = 4
+    RightBumper = 5
+    Back = 6
+    Start = 7
+    Guide = 8
+    LeftThumb = 9
+    RightThumb = 10
+    DpadUp = 11
+    DpadRight = 12
+    DpadDown = 13
+    DpadLeft = 14
+}
+
+pub enum GamepadAxis: i32 derive(Show) {
+    LeftX = 0
+    LeftY = 1
+    RightX = 2
+    RightY = 3
+    LeftTrigger = 4
+    RightTrigger = 5
+}
+
+// GLFWgamepadstate, read through a struct of the same layout (its fields
+// are private in `glfw_sys`).
+struct State {
+    buttons: [15]u8
+    axes: [6]f32
+}
+
+pub struct Gamepad {
+    pub name: str
+    buttons: [15]u8
+    axes: [6]f32
+}
+
+pub fn Gamepad.button(self, b: GamepadButton) -> bool {
+    return self.buttons[int(i32(b))] == u8(sys.press)
+}
+
+/// -1 to 1; triggers rest at -1.
+pub fn Gamepad.axis(self, a: GamepadAxis) -> f32 {
+    return self.axes[int(i32(a))]
+}
+
+/// Joystick slots in use (0 to 15).
+pub fn joysticks() -> List[int] {
+    var out: List[int] = []
+    guard window.init().is_ok() else {
+        return out
+    }
+    for j in 0..16 {
+        if sys.joystick_present(i32(j)) != 0 {
+            out.push(j)
+        }
+    }
+    return out
+}
+
+/// Joystick `j` as a gamepad, when it is one.
+pub fn gamepad(j: int) -> Option[Gamepad] {
+    guard j >= 0 and j < 16 and window.init().is_ok() else {
+        return None
+    }
+    var s = State { buttons: zeroed(), axes: zeroed() }
+    unsafe {
+        guard sys.get_gamepad_state(i32(j), Ptr.of_mut(mut s).cast[sys.Gamepadstate]()) != 0 else {
+            return None
+        }
+    }
+    return Some(Gamepad { name: sys.get_gamepad_name(i32(j)).unwrap_or(""), buttons: s.buttons, axes: s.axes })
+}
+
+/// Seconds since GLFW was initialized.
+pub fn time() -> f64 {
+    return sys.get_time()
+}

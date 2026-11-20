@@ -6,3 +6,5 @@ license = "Apache-2.0 OR BSD-2-Clause"
 
 [dependencies]
 vk = { path = "../vk" }
+raw_window_handle = { path = "../raw_window_handle" }
+vk_window = { path = "../vk_window" }

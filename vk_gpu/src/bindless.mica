@@ -16,7 +16,7 @@ struct Bindless {
     samplers: [4]vk.Sampler
 }
 
-fn sampler(fns: vk.DeviceFnV1_0, device: vk.Device, filter: vk.Filter, address: vk.SamplerAddressMode) -> Result[vk.Sampler, str] {
+fn sampler(fns: ctx.Dev, device: vk.Device, filter: vk.Filter, address: vk.SamplerAddressMode) -> Result[vk.Sampler, str] {
     let mip = if filter == vk.Filter.LINEAR { vk.SamplerMipmapMode.LINEAR } else { vk.SamplerMipmapMode.NEAREST }
     let info = vk.SamplerCreateInfo {
         mag_filter: filter,
@@ -33,7 +33,7 @@ fn sampler(fns: vk.DeviceFnV1_0, device: vk.Device, filter: vk.Filter, address: 
     return Ok(s)
 }
 
-fn create(fns: vk.DeviceFnV1_0, device: vk.Device, slots: u32) -> Result[Bindless, str] {
+fn create(fns: ctx.Dev, device: vk.Device, slots: u32) -> Result[Bindless, str] {
     let clamp = vk.SamplerAddressMode.CLAMP_TO_EDGE
     let repeat = vk.SamplerAddressMode.REPEAT
     let samplers: [4]vk.Sampler = [
@@ -141,7 +141,7 @@ fn write(cx: ctx.Ctx, index: u32, view: vk.ImageView, storage: vk.ImageView) {
     unsafe cx.fns.update_descriptor_sets(cx.device, 2, Ptr.of(writes).cast[vk.WriteDescriptorSet](), 0, Ptr.null())
 }
 
-fn Bindless.destroy(self, fns: vk.DeviceFnV1_0, device: vk.Device) {
+fn Bindless.destroy(self, fns: ctx.Dev, device: vk.Device) {
     fns.destroy_pipeline_layout(device, self.layout, Ptr.null())
     fns.destroy_descriptor_pool(device, self.pool, Ptr.null())
     fns.destroy_descriptor_set_layout(device, self.set_layout, Ptr.null())

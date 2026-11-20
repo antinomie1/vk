@@ -1,0 +1,8 @@
+[package]
+name = "glfw_link_windows"
+version = "0.1.0"
+description = "Links GLFW on Windows (glfw3, static) and what it uses"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[build]
+libs = ["glfw3", "gdi32", "user32", "shell32"]

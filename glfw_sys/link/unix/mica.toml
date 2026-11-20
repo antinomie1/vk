@@ -1,0 +1,8 @@
+[package]
+name = "glfw_link_unix"
+version = "0.1.0"
+description = "Links GLFW on Linux and macOS (libglfw)"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[build]
+libs = ["glfw"]

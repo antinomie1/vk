@@ -1,0 +1,12 @@
+[package]
+name = "vk_window"
+version = "0.1.0"
+description = "Vulkan surfaces for raw window handles (like ash-window)"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+vk = { path = "../vk" }
+raw_window_handle = { path = "../raw_window_handle" }
+
+[dev-dependencies]
+glfw = { path = "../glfw" }

@@ -1,0 +1,115 @@
+// vk_window: a Vulkan surface for a `raw_window_handle.WindowHandle` (as
+// Rust's ash-window). `extensions` names the instance extensions the handle
+// needs; `create_surface` makes the surface with the platform's command. On
+// macOS the surface is a Metal one: a CAMetalLayer is attached to the view
+// (MoltenVK also wants VK_KHR_portability_enumeration on the instance).
+
+import vk
+import raw_window_handle as rwh
+
+/// VK_KHR_surface and the platform's surface extension for `h`.
+pub fn extensions(h: rwh.WindowHandle) -> [2]str {
+    let platform = match h {
+        Xlib => vk.khr_xlib_surface_extension_name
+        Xcb => vk.khr_xcb_surface_extension_name
+        Wayland => vk.khr_wayland_surface_extension_name
+        Win32 => vk.khr_win32_surface_extension_name
+        AppKit => vk.ext_metal_surface_extension_name
+    }
+    return [vk.khr_surface_extension_name, platform]
+}
+
+fn missing(ext: str) -> str {
+    return "{ext} is not enabled on this instance"
+}
+
+/// A surface for `h` on `instance`, which was created with `extensions(h)`;
+/// `st` resolves its commands. Destroy it (vkDestroySurfaceKHR) before the
+/// window closes.
+pub fn create_surface(st: vk.StaticFn, instance: vk.Instance, h: rwh.WindowHandle) -> Result[vk.SurfaceKHR, str] {
+    var surface = vk.SurfaceKHR {}
+    var r = vk.VkResult.SUCCESS
+    match h {
+        Xlib(x) => {
+            guard let Some(f) = vk.KhrXlibSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)) else {
+                return Err(missing(vk.khr_xlib_surface_extension_name))
+            }
+            let info = vk.XlibSurfaceCreateInfoKHR { dpy: x.display, window: usize(x.window) }
+            unsafe r = f.create_xlib_surface_khr(instance, Ptr.of(info), Ptr.null(), mut surface)
+        }
+        Xcb(x) => {
+            guard let Some(f) = vk.KhrXcbSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)) else {
+                return Err(missing(vk.khr_xcb_surface_extension_name))
+            }
+            let info = vk.XcbSurfaceCreateInfoKHR { connection: x.connection, window: x.window }
+            unsafe r = f.create_xcb_surface_khr(instance, Ptr.of(info), Ptr.null(), mut surface)
+        }
+        Wayland(w) => {
+            guard let Some(f) = vk.KhrWaylandSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)) else {
+                return Err(missing(vk.khr_wayland_surface_extension_name))
+            }
+            let info = vk.WaylandSurfaceCreateInfoKHR { display: w.display, surface: w.surface }
+            unsafe r = f.create_wayland_surface_khr(instance, Ptr.of(info), Ptr.null(), mut surface)
+        }
+        Win32(w) => {
+            guard let Some(f) = vk.KhrWin32SurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)) else {
+                return Err(missing(vk.khr_win32_surface_extension_name))
+            }
+            let info = vk.Win32SurfaceCreateInfoKHR { hinstance: w.hinstance, hwnd: w.hwnd }
+            unsafe r = f.create_win32_surface_khr(instance, Ptr.of(info), Ptr.null(), mut surface)
+        }
+        AppKit(a) => {
+            guard let Some(f) = vk.ExtMetalSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)) else {
+                return Err(missing(vk.ext_metal_surface_extension_name))
+            }
+            unsafe let layer = try metal_layer(a.ns_view)
+            let info = vk.MetalSurfaceCreateInfoEXT { p_layer: layer }
+            unsafe r = f.create_metal_surface_ext(instance, Ptr.of(info), Ptr.null(), mut surface)
+        }
+    }
+    guard r == vk.VkResult.SUCCESS else {
+        return Err("creating a surface: {r}")
+    }
+    return Ok(surface)
+}
+
+when os == "macos" {
+    /// The Objective-C runtime, resolved at run time so that `objc_msgSend`
+    /// can be called with each signature it is used with.
+    extern table Objc {
+        fn get_class(name: str) -> Ptr[u8] = "objc_getClass"
+        fn sel(name: str) -> Ptr[u8] = "sel_registerName"
+        fn send(obj: Ptr[u8], sel: Ptr[u8]) -> Ptr[u8] = "objc_msgSend"
+        fn send_ptr(obj: Ptr[u8], sel: Ptr[u8], arg: Ptr[u8]) = "objc_msgSend"
+        fn send_bool(obj: Ptr[u8], sel: Ptr[u8], arg: bool) = "objc_msgSend"
+        fn send_f64(obj: Ptr[u8], sel: Ptr[u8], arg: f64) = "objc_msgSend"
+        fn get_f64(obj: Ptr[u8], sel: Ptr[u8]) -> f64 = "objc_msgSend"
+    }
+
+    /// Loads QuartzCore, which defines CAMetalLayer.
+    extern table QuartzCore {
+        fn media_time() -> f64 = "CACurrentMediaTime"
+    }
+
+    /// A CAMetalLayer backing `view` at its window's pixel scale.
+    unsafe fn metal_layer(view: Ptr[u8]) -> Result[Ptr[u8], str] {
+        let objc = try Objc.open("/usr/lib/libobjc.A.dylib")
+        discard try QuartzCore.open("/System/Library/Frameworks/QuartzCore.framework/QuartzCore")
+        let class = objc.get_class("CAMetalLayer")
+        guard not class.is_null() else {
+            return Err("CAMetalLayer is unavailable")
+        }
+        let layer = objc.send(class, objc.sel("layer"))
+        objc.send_ptr(view, objc.sel("setLayer:"), layer)
+        objc.send_bool(view, objc.sel("setWantsLayer:"), true)
+        let window = objc.send(view, objc.sel("window"))
+        if not window.is_null() {
+            objc.send_f64(layer, objc.sel("setContentsScale:"), objc.get_f64(window, objc.sel("backingScaleFactor")))
+        }
+        return Ok(layer)
+    }
+} else {
+    unsafe fn metal_layer(view: Ptr[u8]) -> Result[Ptr[u8], str] {
+        return Err("AppKit windows need macOS")
+    }
+}

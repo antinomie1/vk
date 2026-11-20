@@ -6,6 +6,4 @@ license = "Apache-2.0 OR BSD-2-Clause"
 
 [dependencies]
 vk_gpu = { path = "../../vk_gpu" }
-
-[build]
-libs = ["xcb"]
+glfw = { path = "../../glfw" }

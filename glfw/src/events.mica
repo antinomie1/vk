@@ -1,0 +1,152 @@
+// Events. GLFW calls these callbacks from inside `glfwPollEvents` (on the
+// main thread); they queue an `Event` tagged with its window, and
+// `Window.events` takes that window's share. A window that never reads its
+// events keeps at most `cap` of them.
+
+import std.mem
+import glfw_sys as sys
+import key
+import input
+import cstr
+
+struct Queued {
+    w: u64
+    e: input.Event
+}
+
+static var queue: List[Queued] = []
+
+let cap = 4096
+
+fn push(w: u64, take e: input.Event) {
+    unsafe {
+        if queue.len() < cap {
+            queue.push(Queued { w, e })
+        }
+    }
+}
+
+/// The queued events of window `w`, oldest first.
+fn drain(w: u64) -> List[input.Event] {
+    var mine: List[input.Event] = []
+    unsafe {
+        var rest: List[Queued] = []
+        var all = mem.replace(mut queue, [])
+        all.reverse()
+        while true {
+            match all.pop() {
+                Some(Queued { w: from, e }) => {
+                    if from == w {
+                        mine.push(e)
+                    } else {
+                        rest.push(Queued { w: from, e })
+                    }
+                }
+                None => {
+                    break
+                }
+            }
+        }
+        queue = rest
+    }
+    return mine
+}
+
+fn bool_of(v: i32) -> bool {
+    return v != 0
+}
+
+extern fn mica_glfw_key(w: u64, k: i32, scancode: i32, action: i32, mods: i32) {
+    push(w, input.Event.Key(key.Key.from(k).unwrap_or(key.Key.Unknown), scancode, input.action(action), input.mods(mods)))
+}
+
+extern fn mica_glfw_char(w: u64, c: u32) {
+    push(w, input.Event.Char(c))
+}
+
+extern fn mica_glfw_mouse_button(w: u64, b: i32, action: i32, mods: i32) {
+    if let Some(button) = input.MouseButton.from(b) {
+        push(w, input.Event.MouseButton(button, input.action(action), input.mods(mods)))
+    }
+}
+
+extern fn mica_glfw_cursor_pos(w: u64, x: f64, y: f64) {
+    push(w, input.Event.CursorPos(x, y))
+}
+
+extern fn mica_glfw_cursor_enter(w: u64, entered: i32) {
+    push(w, input.Event.CursorEnter(bool_of(entered)))
+}
+
+extern fn mica_glfw_scroll(w: u64, x: f64, y: f64) {
+    push(w, input.Event.Scroll(x, y))
+}
+
+extern fn mica_glfw_pos(w: u64, x: i32, y: i32) {
+    push(w, input.Event.Pos(x, y))
+}
+
+extern fn mica_glfw_size(w: u64, width: i32, height: i32) {
+    push(w, input.Event.Size(width, height))
+}
+
+extern fn mica_glfw_framebuffer_size(w: u64, width: i32, height: i32) {
+    push(w, input.Event.FramebufferSize(width, height))
+}
+
+extern fn mica_glfw_content_scale(w: u64, x: f32, y: f32) {
+    push(w, input.Event.ContentScale(x, y))
+}
+
+extern fn mica_glfw_close(w: u64) {
+    push(w, input.Event.Close)
+}
+
+extern fn mica_glfw_refresh(w: u64) {
+    push(w, input.Event.Refresh)
+}
+
+extern fn mica_glfw_focus(w: u64, focused: i32) {
+    push(w, input.Event.Focus(bool_of(focused)))
+}
+
+extern fn mica_glfw_iconify(w: u64, iconified: i32) {
+    push(w, input.Event.Iconify(bool_of(iconified)))
+}
+
+extern fn mica_glfw_maximize(w: u64, maximized: i32) {
+    push(w, input.Event.Maximize(bool_of(maximized)))
+}
+
+extern unsafe fn mica_glfw_drop(w: u64, count: i32, paths: Ptr[Ptr[i8]]) {
+    var list: List[str] = []
+    for i in 0..int(count) {
+        list.push(cstr.read(paths.offset(i).read().cast[u8]()))
+    }
+    push(w, input.Event.FileDrop(list))
+}
+
+/// Route window `w`'s callbacks into the queue.
+fn install(w: u64) {
+    discard sys.set_key_callback(w, mica_glfw_key)
+    discard sys.set_char_callback(w, mica_glfw_char)
+    discard sys.set_mouse_button_callback(w, mica_glfw_mouse_button)
+    discard sys.set_cursor_pos_callback(w, mica_glfw_cursor_pos)
+    discard sys.set_cursor_enter_callback(w, mica_glfw_cursor_enter)
+    discard sys.set_scroll_callback(w, mica_glfw_scroll)
+    discard sys.set_window_pos_callback(w, mica_glfw_pos)
+    discard sys.set_window_size_callback(w, mica_glfw_size)
+    discard sys.set_framebuffer_size_callback(w, mica_glfw_framebuffer_size)
+    discard sys.set_window_content_scale_callback(w, mica_glfw_content_scale)
+    discard sys.set_window_close_callback(w, mica_glfw_close)
+    discard sys.set_window_refresh_callback(w, mica_glfw_refresh)
+    discard sys.set_window_focus_callback(w, mica_glfw_focus)
+    discard sys.set_window_iconify_callback(w, mica_glfw_iconify)
+    discard sys.set_window_maximize_callback(w, mica_glfw_maximize)
+    discard sys.set_drop_callback(w, mica_glfw_drop)
+}
+
+/// Forget window `w`'s events (it closed).
+fn forget(w: u64) {
+    discard drain(w)
+}

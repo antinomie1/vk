@@ -11,8 +11,8 @@ import device
 /// Window-system tables, present when their extensions are enabled.
 struct Wsi {
     surf: Option[vk.KhrSurfaceInstanceFn]
-    xcb: Option[vk.KhrXcbSurfaceInstanceFn]
-    wayland: Option[vk.KhrWaylandSurfaceInstanceFn]
+    /// Platform surface extensions enabled on the instance.
+    platforms: List[str]
     swapchain: Option[vk.KhrSwapchainDeviceFn]
 }
 
@@ -76,16 +76,15 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
     discard entry.enumerate_instance_extension_properties(Ptr.null(), mut n, iexts)
     var enable: List[str] = []
     let want_surface = not o.headless and has_ext(iexts, vk.khr_surface_extension_name)
-    let want_xcb = want_surface and has_ext(iexts, vk.khr_xcb_surface_extension_name)
-    let want_wayland = want_surface and has_ext(iexts, vk.khr_wayland_surface_extension_name)
+    var platforms: List[str] = []
     if want_surface {
         enable.push(vk.khr_surface_extension_name)
-    }
-    if want_xcb {
-        enable.push(vk.khr_xcb_surface_extension_name)
-    }
-    if want_wayland {
-        enable.push(vk.khr_wayland_surface_extension_name)
+        for name in [vk.khr_xlib_surface_extension_name, vk.khr_xcb_surface_extension_name, vk.khr_wayland_surface_extension_name, vk.khr_win32_surface_extension_name, vk.ext_metal_surface_extension_name] {
+            if has_ext(iexts, name) {
+                enable.push(name.clone())
+                platforms.push(name)
+            }
+        }
     }
     var layers: List[str] = []
     if o.validation {
@@ -101,10 +100,17 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
             layers.push(name)
         }
     }
-    unsafe let eptrs = cstrs(enable)
     unsafe let lptrs = cstrs(layers)
     unsafe let app = vk.ApplicationInfo { p_application_name: o.app_name.as_cstr(), api_version: vk.api_version_1_3 }
+    // Portability drivers (MoltenVK on macOS) are listed only when asked for.
+    var iflags = vk.InstanceCreateFlags(0)
+    if has_ext(iexts, vk.khr_portability_enumeration_extension_name) {
+        enable.push(vk.khr_portability_enumeration_extension_name)
+        iflags = vk.InstanceCreateFlags.ENUMERATE_PORTABILITY_KHR
+    }
+    unsafe let eptrs = cstrs(enable)
     unsafe let iinfo = vk.InstanceCreateInfo {
+        flags: iflags,
         p_application_info: Ptr.of(app),
         enabled_layer_count: u32(lptrs.len()),
         pp_enabled_layer_names: lptrs.as_ptr(),
@@ -113,10 +119,9 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
     }
     var instance = vk.Instance {}
     unsafe try ctx.ok(entry.create_instance(Ptr.of(iinfo), Ptr.null(), mut instance), "vkCreateInstance")
-    let inst = vk.InstanceFnV1_0.load(fn(n) => st.get_instance_proc_addr(instance, n))
-    let inst11 = vk.InstanceFnV1_1.load(fn(n) => st.get_instance_proc_addr(instance, n))
+    let inst = ctx.Inst.load(fn(n) => st.get_instance_proc_addr(instance, n))
 
-    let p = try pick(inst, inst11, instance)
+    let p = try pick(inst, instance)
     var dexts: List[vk.ExtensionProperties] = []
     var nd: u32 = 0
     discard inst.enumerate_device_extension_properties(p.pdev, Ptr.null(), mut nd, Ptr.null())
@@ -131,6 +136,10 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
     }
     // Sharing: enabled whenever the driver has them (they cost nothing).
     var on: List[bool] = []
+    // Required whenever the device has it (a portability implementation).
+    if has_ext(dexts, vk.khr_portability_subset_extension_name) {
+        denable.push(vk.khr_portability_subset_extension_name)
+    }
     for name in [vk.khr_external_memory_fd_extension_name, vk.ext_external_memory_dma_buf_extension_name, vk.ext_image_drm_format_modifier_extension_name, vk.ext_queue_family_foreign_extension_name, vk.khr_external_semaphore_fd_extension_name] {
         let has_it = has_ext(dexts, name)
         on.push(has_it)
@@ -149,7 +158,7 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
         has12.p_next = Ptr.of_mut(mut has13).cast[u8]()
         has.p_next = Ptr.of_mut(mut has12).cast[u8]()
     }
-    inst11.get_physical_device_features2(p.pdev, mut has)
+    inst.get_physical_device_features2(p.pdev, mut has)
     var f13 = vk.PhysicalDeviceVulkan13Features {
         dynamic_rendering: 1,
         synchronization2: 1,
@@ -196,14 +205,14 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
     }
     var dev = vk.Device {}
     unsafe try ctx.ok(inst.create_device(p.pdev, Ptr.of(dinfo), Ptr.null(), mut dev), "vkCreateDevice")
-    let fns = vk.DeviceFnV1_0.load(fn(n) => inst.get_device_proc_addr(dev, n))
+    let fns = ctx.Dev.load(fn(n) => inst.get_device_proc_addr(dev, n))
     var queue = vk.Queue {}
     fns.get_device_queue(dev, p.family, 0, mut queue)
 
     var p12 = vk.PhysicalDeviceVulkan12Properties {}
     var props = vk.PhysicalDeviceProperties2 {}
     unsafe props.p_next = Ptr.of_mut(mut p12).cast[u8]()
-    inst11.get_physical_device_properties2(p.pdev, mut props)
+    inst.get_physical_device_properties2(p.pdev, mut props)
     var limit = p12.max_descriptor_set_update_after_bind_sampled_images
     limit = min(limit, p12.max_descriptor_set_update_after_bind_storage_images)
     limit = min(limit, p12.max_per_stage_descriptor_update_after_bind_sampled_images)
@@ -224,8 +233,6 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
     let cx = ctx.Ctx {
         inst,
         fns,
-        v12: vk.DeviceFnV1_2.load(fn(n) => inst.get_device_proc_addr(dev, n)),
-        v13: vk.DeviceFnV1_3.load(fn(n) => inst.get_device_proc_addr(dev, n)),
         cmd: ctx.Cmds.load(fn(n) => inst.get_device_proc_addr(dev, n)),
         instance,
         pdev: p.pdev,
@@ -238,8 +245,7 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
     }
     let wsi = Wsi {
         surf: if want_surface { vk.KhrSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)) } else { None },
-        xcb: if want_xcb { vk.KhrXcbSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)) } else { None },
-        wayland: if want_wayland { vk.KhrWaylandSurfaceInstanceFn.try_load(fn(n) => st.get_instance_proc_addr(instance, n)) } else { None },
+        platforms,
         swapchain: if want_swapchain { vk.KhrSwapchainDeviceFn.try_load(fn(n) => inst.get_device_proc_addr(dev, n)) } else { None },
     }
     let ext = External {
@@ -253,7 +259,7 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
 
 /// The best Vulkan 1.3 device with every required feature (discrete over
 /// integrated over the rest), and its first graphics + compute family.
-fn pick(inst: vk.InstanceFnV1_0, inst11: vk.InstanceFnV1_1, instance: vk.Instance) -> Result[Pick, str] {
+fn pick(inst: ctx.Inst, instance: vk.Instance) -> Result[Pick, str] {
     var count: u32 = 0
     try ctx.ok(inst.enumerate_physical_devices(instance, mut count, Ptr.null()), "vkEnumeratePhysicalDevices")
     var pdevs: List[vk.PhysicalDevice] = []
@@ -265,7 +271,7 @@ fn pick(inst: vk.InstanceFnV1_0, inst11: vk.InstanceFnV1_1, instance: vk.Instanc
     for pd in pdevs {
         var props = vk.PhysicalDeviceProperties {}
         inst.get_physical_device_properties(pd, mut props)
-        guard props.api_version >= vk.api_version_1_3 and supported(inst11, pd) else {
+        guard props.api_version >= vk.api_version_1_3 and supported(inst, pd) else {
             continue
         }
         var n: u32 = 0
@@ -295,7 +301,7 @@ fn pick(inst: vk.InstanceFnV1_0, inst11: vk.InstanceFnV1_1, instance: vk.Instanc
     return Ok(best)
 }
 
-fn supported(inst11: vk.InstanceFnV1_1, pd: vk.PhysicalDevice) -> bool {
+fn supported(inst: ctx.Inst, pd: vk.PhysicalDevice) -> bool {
     var f12 = vk.PhysicalDeviceVulkan12Features {}
     var f13 = vk.PhysicalDeviceVulkan13Features {}
     var f = vk.PhysicalDeviceFeatures2 {}
@@ -303,6 +309,6 @@ fn supported(inst11: vk.InstanceFnV1_1, pd: vk.PhysicalDevice) -> bool {
         f12.p_next = Ptr.of_mut(mut f13).cast[u8]()
         f.p_next = Ptr.of_mut(mut f12).cast[u8]()
     }
-    inst11.get_physical_device_features2(pd, mut f)
+    inst.get_physical_device_features2(pd, mut f)
     return f13.dynamic_rendering == 1 and f13.synchronization2 == 1 and f12.timeline_semaphore == 1 and f12.buffer_device_address == 1 and f12.runtime_descriptor_array == 1 and f12.descriptor_binding_partially_bound == 1 and f12.descriptor_binding_sampled_image_update_after_bind == 1 and f12.descriptor_binding_storage_image_update_after_bind == 1 and f12.descriptor_binding_update_unused_while_pending == 1 and f12.shader_sampled_image_array_non_uniform_indexing == 1 and f12.separate_depth_stencil_layouts == 1
 }

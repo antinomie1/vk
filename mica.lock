@@ -7,16 +7,43 @@ version = "0.1.0"
 source = "path+generator"
 
 [[package]]
+name = "glfw"
+version = "0.1.0"
+source = "path+glfw"
+dependencies = ["glfw_sys", "raw_window_handle"]
+
+[[package]]
+name = "glfw_link_unix"
+version = "0.1.0"
+source = "path+glfw_sys/link/unix"
+
+[[package]]
+name = "glfw_link_windows"
+version = "0.1.0"
+source = "path+glfw_sys/link/windows"
+
+[[package]]
+name = "glfw_sys"
+version = "0.1.0"
+source = "path+glfw_sys"
+dependencies = ["glfw_link_unix", "glfw_link_windows"]
+
+[[package]]
+name = "raw_window_handle"
+version = "0.1.0"
+source = "path+raw_window_handle"
+
+[[package]]
 name = "triangle"
 version = "0.1.0"
 source = "path+examples/triangle"
-dependencies = ["vk"]
+dependencies = ["glfw", "vk", "vk_window"]
 
 [[package]]
 name = "triangle_gpu"
 version = "0.1.0"
 source = "path+examples/triangle_gpu"
-dependencies = ["vk_gpu"]
+dependencies = ["glfw", "vk_gpu"]
 
 [[package]]
 name = "vk"
@@ -39,10 +66,16 @@ dependencies = ["vk_gpu"]
 name = "vk_gpu"
 version = "0.1.0"
 source = "path+vk_gpu"
-dependencies = ["vk"]
+dependencies = ["raw_window_handle", "vk", "vk_window"]
 
 [[package]]
 name = "vk_graph"
 version = "0.1.0"
 source = "path+vk_graph"
 dependencies = ["vk_gpu"]
+
+[[package]]
+name = "vk_window"
+version = "0.1.0"
+source = "path+vk_window"
+dependencies = ["glfw", "raw_window_handle", "vk"]

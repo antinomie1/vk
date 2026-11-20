@@ -1,0 +1,130 @@
+// Monitors, as snapshots: GLFW frees a monitor when it disconnects, so
+// nothing here keeps its handle; windows look monitors up by index when
+// they need one.
+
+import glfw_sys as sys
+import cstr
+import window
+
+pub struct VideoMode derive(Show) {
+    pub width: i32
+    pub height: i32
+    pub red_bits: i32
+    pub green_bits: i32
+    pub blue_bits: i32
+    pub refresh_rate: i32
+}
+
+pub struct Monitor {
+    pub name: str
+    pub primary: bool
+    /// Position of its top left on the virtual desktop.
+    pub x: i32
+    pub y: i32
+    /// The area not covered by task bars and menus: x, y, width, height.
+    pub workarea: (i32, i32, i32, i32)
+    pub width_mm: i32
+    pub height_mm: i32
+    pub content_scale: (f32, f32)
+    pub mode: VideoMode
+    pub modes: List[VideoMode]
+}
+
+fn handles() -> List[sys.Monitor] {
+    var out: List[sys.Monitor] = []
+    guard window.init().is_ok() else {
+        return out
+    }
+    var n: i32 = 0
+    unsafe {
+        let p = sys.get_monitors(Ptr.of_mut(mut n))
+        for i in 0..int(n) {
+            out.push(p.offset(i).read())
+        }
+    }
+    return out
+}
+
+fn handle(index: int) -> Result[sys.Monitor, str] {
+    let all = handles()
+    guard index >= 0 and index < all.len() else {
+        return Err("no monitor {index} (there are {all.len()})")
+    }
+    return Ok(all[index])
+}
+
+fn index_of(m: sys.Monitor) -> Option[int] {
+    guard m != 0 else {
+        return None
+    }
+    return handles().position(fn(h) => h == m)
+}
+
+// GLFWvidmode: `mica bind` keeps record fields private, so it is read
+// through this struct of the same layout.
+struct Vidmode {
+    width: i32
+    height: i32
+    red: i32
+    green: i32
+    blue: i32
+    refresh: i32
+}
+
+unsafe fn mode_at(p: Ptr[Vidmode]) -> VideoMode {
+    let v = p.read()
+    return VideoMode { width: v.width, height: v.height, red_bits: v.red, green_bits: v.green, blue_bits: v.blue, refresh_rate: v.refresh }
+}
+
+fn current_mode(m: sys.Monitor) -> Result[VideoMode, str] {
+    unsafe {
+        let p = sys.get_video_mode(m)
+        guard not p.is_null() else {
+            return Err("the monitor has no video mode")
+        }
+        return Ok(mode_at(p.cast[Vidmode]()))
+    }
+}
+
+/// The connected monitors, the primary one first.
+pub fn monitors() -> List[Monitor] {
+    var out: List[Monitor] = []
+    for m in handles() {
+        var x: i32 = 0
+        var y: i32 = 0
+        var wx: i32 = 0
+        var wy: i32 = 0
+        var ww: i32 = 0
+        var wh: i32 = 0
+        var mw: i32 = 0
+        var mh: i32 = 0
+        var sx: f32 = 1.0
+        var sy: f32 = 1.0
+        var modes: List[VideoMode] = []
+        unsafe {
+            sys.get_monitor_pos(m, Ptr.of_mut(mut x), Ptr.of_mut(mut y))
+            sys.get_monitor_workarea(m, Ptr.of_mut(mut wx), Ptr.of_mut(mut wy), Ptr.of_mut(mut ww), Ptr.of_mut(mut wh))
+            sys.get_monitor_physical_size(m, Ptr.of_mut(mut mw), Ptr.of_mut(mut mh))
+            sys.get_monitor_content_scale(m, Ptr.of_mut(mut sx), Ptr.of_mut(mut sy))
+            var n: i32 = 0
+            let p = sys.get_video_modes(m, Ptr.of_mut(mut n)).cast[Vidmode]()
+            for i in 0..int(n) {
+                modes.push(mode_at(p.offset(i)))
+            }
+        }
+        let mode = current_mode(m).unwrap_or(VideoMode { width: 0, height: 0, red_bits: 0, green_bits: 0, blue_bits: 0, refresh_rate: 0 })
+        out.push(Monitor {
+            name: sys.get_monitor_name(m).unwrap_or(""),
+            primary: m == sys.get_primary_monitor(),
+            x,
+            y,
+            workarea: (wx, wy, ww, wh),
+            width_mm: mw,
+            height_mm: mh,
+            content_scale: (sx, sy),
+            mode,
+            modes,
+        })
+    }
+    return out
+}

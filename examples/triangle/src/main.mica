@@ -1,12 +1,12 @@
-// triangle [frames]: draws a colored triangle in an XCB window until it is
-// closed or Escape is pressed (or for `frames` frames). One frame in flight;
-// the swapchain is rebuilt when the window is resized.
+// triangle [frames]: draws a colored triangle in a GLFW window (X11 or
+// Wayland) until it is closed or Escape is pressed (or for `frames` frames).
+// One frame in flight; the swapchain is rebuilt when the window is resized.
 
 import std.io
 import std.env
 import std.time
 import vk
-import xcb
+import glfw
 import gpu
 import pipeline
 import swapchain
@@ -36,17 +36,24 @@ fn main() -> int {
 }
 
 fn run(frames: int) -> Result[int, str] {
-    var win = try xcb.open("vk triangle", 800, 600)
+    var win = try glfw.Window.open("vk triangle", 800, 600)
     let g = try gpu.init(win)
     let format = try g.surface_format()
     let p = try pipeline.create(g, format.format)
-    let size = vk.Extent2D { width: win.width, height: win.height }
+    let (w0, h0) = win.framebuffer_size()
+    var size = vk.Extent2D { width: w0, height: h0 }
     var sc = try swapchain.create(g, p.pass, format, try swapchain.extent(g, size), vk.SwapchainKHR {})
     let f = try frame(g)
 
     var drawn = 0
     var stale = false
-    while win.poll() and (frames == 0 or drawn < frames) {
+    while win.poll() and not win.key(glfw.Key.Escape) and (frames == 0 or drawn < frames) {
+        // Wayland never reports an out-of-date swapchain: follow the window.
+        let (fw, fh) = win.framebuffer_size()
+        if fw != size.width or fh != size.height {
+            size = vk.Extent2D { width: fw, height: fh }
+            stale = true
+        }
         if stale {
             let now = try swapchain.extent(g, size)
             if now.width == 0 or now.height == 0 {

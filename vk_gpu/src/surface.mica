@@ -5,30 +5,14 @@
 // drawn and presented (its acquire semaphore was already signaled).
 
 import vk
+import raw_window_handle as rwh
+import vk_window
 import ctx
 import res
 import sync
 import device
 import encoder
 import target
-
-/// A native window to create a surface for.
-pub unsafe struct Native {
-    wayland: bool
-    display: Ptr[u8]
-    xcb_window: u32
-    wl_surface: Ptr[u8]
-}
-
-/// An XCB (X11 or XWayland) window.
-pub unsafe fn Native.xcb(connection: Ptr[u8], window: u32) -> Native {
-    return Native { wayland: false, display: connection, xcb_window: window, wl_surface: Ptr.null() }
-}
-
-/// A Wayland `wl_surface` on `display`.
-pub unsafe fn Native.wayland(display: Ptr[u8], surface: Ptr[u8]) -> Native {
-    return Native { wayland: true, display, xcb_window: 0, wl_surface: surface }
-}
 
 /// Frames that may be in flight at once.
 let slots = 2
@@ -58,7 +42,8 @@ pub struct Surface {
     dirty: bool = true
 }
 
-pub fn Surface.create(mut dev: device.Device, w: Native, width: u32, height: u32, vsync: bool) -> Result[Surface, str] {
+/// The swapchain of window `w` (keep the window open until `destroy`).
+pub fn Surface.create(mut dev: device.Device, w: rwh.WindowHandle, width: u32, height: u32, vsync: bool) -> Result[Surface, str] {
     let cx = dev.cx
     guard let Some(surf) = dev.wsi.surf else {
         return Err("VK_KHR_surface is missing (or the device was opened headless)")
@@ -66,20 +51,11 @@ pub fn Surface.create(mut dev: device.Device, w: Native, width: u32, height: u32
     guard let Some(sc) = dev.wsi.swapchain else {
         return Err("VK_KHR_swapchain is missing")
     }
-    var surface = vk.SurfaceKHR {}
-    if w.wayland {
-        guard let Some(wl) = dev.wsi.wayland else {
-            return Err("VK_KHR_wayland_surface is missing")
-        }
-        let info = vk.WaylandSurfaceCreateInfoKHR { display: w.display, surface: w.wl_surface }
-        unsafe try ctx.ok(wl.create_wayland_surface_khr(cx.instance, Ptr.of(info), Ptr.null(), mut surface), "vkCreateWaylandSurfaceKHR")
-    } else {
-        guard let Some(xcb) = dev.wsi.xcb else {
-            return Err("VK_KHR_xcb_surface is missing")
-        }
-        let info = vk.XcbSurfaceCreateInfoKHR { connection: w.display, window: w.xcb_window }
-        unsafe try ctx.ok(xcb.create_xcb_surface_khr(cx.instance, Ptr.of(info), Ptr.null(), mut surface), "vkCreateXcbSurfaceKHR")
+    let need = vk_window.extensions(w)[1].clone()
+    guard dev.wsi.platforms.contains(need) else {
+        return Err("{need} is not available")
     }
+    let surface = try vk_window.create_surface(dev.st, cx.instance, w)
     var present: vk.Bool32 = 0
     discard surf.get_physical_device_surface_support_khr(cx.pdev, cx.family, surface, mut present)
     guard present == vk.r#true else {

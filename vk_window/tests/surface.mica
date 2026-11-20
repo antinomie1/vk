@@ -1,0 +1,40 @@
+// Extensions per handle, and a real surface for a GLFW window on an
+// instance made with them. The surface part is skipped without a display
+// or a Vulkan driver.
+
+import vk
+import glfw
+import raw_window_handle as rwh
+import vk_window
+
+test "extensions per platform" {
+    let x = rwh.WindowHandle.Xlib(rwh.Xlib { display: Ptr.null(), window: 1 })
+    let w = rwh.WindowHandle.Wayland(rwh.Wayland { display: Ptr.null(), surface: Ptr.null() })
+    assert_eq(vk_window.extensions(x), ["VK_KHR_surface", "VK_KHR_xlib_surface"])
+    assert_eq(vk_window.extensions(w)[1], "VK_KHR_wayland_surface")
+}
+
+test "a surface for a window" {
+    guard let Ok(win) = glfw.Window.open("vk_window test", 64, 64) else {
+        return
+    }
+    guard let Ok(st) = vk.StaticFn.open(vk.loader_name) else {
+        return
+    }
+    let entry = vk.EntryFnV1_0.load(fn(n) => st.get_instance_proc_addr(vk.Instance {}, n))
+    let h = win.window_handle()
+    let names = vk_window.extensions(h)
+    unsafe let exts: [2]Ptr[u8] = [names[0].as_cstr(), names[1].as_cstr()]
+    unsafe let info = vk.InstanceCreateInfo { enabled_extension_count: 2, pp_enabled_extension_names: Ptr.of(exts).cast[Ptr[u8]]() }
+    var instance = vk.Instance {}
+    unsafe let r = entry.create_instance(Ptr.of(info), Ptr.null(), mut instance)
+    guard r == vk.VkResult.SUCCESS else {
+        return
+    }
+    let surface = vk_window.create_surface(st, instance, h).unwrap()
+    assert(surface.raw != 0)
+    let surf = vk.KhrSurfaceInstanceFn.load(fn(n) => st.get_instance_proc_addr(instance, n))
+    surf.destroy_surface_khr(instance, surface, Ptr.null())
+    let inst = vk.InstanceFnV1_0.load(fn(n) => st.get_instance_proc_addr(instance, n))
+    inst.destroy_instance(instance, Ptr.null())
+}

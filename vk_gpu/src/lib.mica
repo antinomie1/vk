@@ -34,7 +34,6 @@ pub type Cull = pipeline.Cull
 pub type Frame = target.Frame
 pub type Offscreen = target.Offscreen
 pub type Surface = surface.Surface
-pub type Native = surface.Native
 pub type Format = vk.Format
 pub type Dmabuf = external.Dmabuf
 

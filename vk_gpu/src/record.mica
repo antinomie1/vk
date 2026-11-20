@@ -109,7 +109,7 @@ fn check(dev: device.Device, e: encoder.Encoder) -> Result[(), str] {
                 let pi = try pipe(dev, p)
                 if pi.point == vk.PipelineBindPoint.GRAPHICS {
                     guard pi.color == color and pi.depth == depth else {
-                        return Err("pipeline built for {pi.color} / {pi.depth} bound in a {color} / {depth} pass")
+                        return Err("pipeline built for formats {i32(pi.color)} / {i32(pi.depth)} bound in a {i32(color)} / {i32(depth)} pass")
                     }
                 } else if color != vk.Format.UNDEFINED {
                     return Err("compute pipeline bound in a render pass")

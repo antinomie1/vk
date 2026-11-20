@@ -233,7 +233,7 @@ fn create_buffer(cx: ctx.Ctx, mut mem: alloc.Allocator, size: u64, m: alloc.Mem)
 
 fn address(cx: ctx.Ctx, b: vk.Buffer) -> u64 {
     let info = vk.BufferDeviceAddressInfo { buffer: b }
-    unsafe let addr = cx.v12.get_buffer_device_address(cx.device, Ptr.of(info))
+    unsafe let addr = cx.fns.get_buffer_device_address(cx.device, Ptr.of(info))
     return addr
 }
 

@@ -1,0 +1,9 @@
+[package]
+name = "glfw"
+version = "0.1.0"
+description = "Safe GLFW windows on glfw_sys, with raw window handles"
+license = "Apache-2.0 OR BSD-2-Clause"
+
+[dependencies]
+glfw_sys = { path = "../glfw_sys" }
+raw_window_handle = { path = "../raw_window_handle" }
