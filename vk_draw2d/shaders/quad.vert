@@ -12,6 +12,6 @@ void main() {
     vec2 c = corners[gl_VertexIndex];
     gl_Position = vec4((q.rect.xy + c * q.rect.zw) / p.size * 2.0 - 1.0, 0.0, 1.0);
     local = (c - 0.5) * q.rect.zw;
-    uv = mix(q.uv.xy, q.uv.zw, c);
+    uv = q.uv + c.x * q.du + c.y * q.dv;
     index = gl_InstanceIndex;
 }

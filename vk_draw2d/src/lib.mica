@@ -1,31 +1,52 @@
 // vk_draw2d: rectangles, rounded rectangles, borders, soft shadows and images,
-// batched into one instance list and drawn with one instanced draw per
-// target. Every shape is a rounded box evaluated as a distance field, so
-// corners, rings and shadows cost what a plain quad costs. Instances go
-// through the upload ring and are read by buffer address; textures by
-// bindless index. Colors are straight alpha in the target's space (use
-// `srgb` for sRGB targets); textures are premultiplied.
+// batched into one instance list and drawn in one pass per target. Every
+// shape is a rounded box evaluated as a distance field, so corners, rings
+// and shadows cost what a plain quad costs. Instances go through the upload
+// ring and are read by buffer address; textures by bindless index. Colors
+// are straight alpha in the target's space (use `srgb` for sRGB targets);
+// textures are premultiplied.
+//
+// Drawing only damage: each damaged rectangle is one scissored instanced
+// draw of the shapes that reach it, starting from the topmost opaque shape
+// that hides all of it. What is under an opaque window costs nothing.
 
+import std.mem
 import vk_gpu as gpu
 pub import rect
+pub import transform
 
 pub type Rect = rect.Rect
+pub type Transform = transform.Transform
+pub type UvMap = transform.UvMap
 
 /// One instance, laid out as `Quad` in shaders/quad.glsl (std430).
 struct Quad derive(Bytes) {
     rect: vec4
-    uv: vec4
     color: vec4
     clip: vec4
+    uv: vec2
+    du: vec2
+    dv: vec2
     radius: f32
     border: f32
     soft: f32
     tex: u32
+    pad0: f32 = 0.0
+    pad1: f32 = 0.0
 }
+
+let quad_size: u64 = 96
 
 struct Push derive(Bytes) {
     addr: u64
     size: vec2
+}
+
+/// The instances `[at, at + n)` of the staged list, drawn scissored to `area`.
+struct Span {
+    area: Rect
+    at: int
+    n: int
 }
 
 let no_texture: u32 = 0xFFFFFFFF
@@ -33,13 +54,17 @@ let no_texture: u32 = 0xFFFFFFFF
 pub struct Canvas {
     pipe: gpu.Pipeline
     quads: List[Quad] = []
-    /// Scratch: the quads that reach the damage.
-    visible: List[Quad] = []
+    /// Where each shape is opaque, in whole pixels; empty for none.
+    covers: List[Rect] = []
     clips: List[Rect] = []
+    /// Scratch: the quads that reach each damaged rectangle, in spans.
+    visible: List[Quad] = []
+    spans: List[Span] = []
 }
 
 /// A canvas drawing into targets of `format`.
 pub fn Canvas.create(mut dev: gpu.Device, format: gpu.Format) -> Result[Canvas, str] {
+    assert(u64(size_of[Quad]()) == quad_size)
     let d = gpu.Graphics { color: format, blend: gpu.Blend.Alpha }
     let pipe = try dev.graphics(d, embed("../shaders/quad.vert.spv"), embed("../shaders/quad.frag.spv"))
     return Ok(Canvas { pipe })
@@ -52,6 +77,7 @@ pub fn Canvas.destroy(self, mut dev: gpu.Device) {
 /// Forget the shapes of the last frame (keeps the memory).
 pub fn Canvas.clear(mut self) {
     self.quads.clear()
+    self.covers.clear()
     self.clips.clear()
 }
 
@@ -59,46 +85,77 @@ pub fn Canvas.len(self) -> int {
     return self.quads.len()
 }
 
-fn Canvas.add(mut self, r: Rect, color: vec4, radius: f32, border: f32, soft: f32, tex: u32, uv: vec4) {
-    var clip = vec4(-1.0e9, -1.0e9, 1.0e9, 1.0e9)
-    if let Some(c) = self.clips.last() {
-        clip = vec4(c.x, c.y, c.x + c.w, c.y + c.h)
-    }
-    self.quads.push(Quad { rect: vec4(r.x, r.y, r.w, r.h), uv, color, clip, radius, border, soft, tex })
+fn Canvas.clip(self) -> Rect {
+    return self.clips.last().unwrap_or(Rect { x: -1.0e9, y: -1.0e9, w: 2.0e9, h: 2.0e9 })
 }
 
-fn whole() -> vec4 {
-    return vec4(0.0, 0.0, 1.0, 1.0)
+fn whole() -> UvMap {
+    return UvMap { origin: vec2(0.0, 0.0), du: vec2(1.0, 0.0), dv: vec2(0.0, 1.0) }
+}
+
+/// Inside a box with corners of `radius`: the corners cut at 45 degrees
+/// leave 0.29 radius on each side.
+fn inside(r: Rect, radius: f32) -> Rect {
+    return if radius > 0.0 { r.grow(-0.293 * radius) } else { r }
+}
+
+fn Canvas.add(mut self, r: Rect, color: vec4, radius: f32, border: f32, soft: f32, tex: u32, m: UvMap, opaque: bool) {
+    let c = self.clip()
+    let clip = vec4(c.x, c.y, c.x + c.w, c.y + c.h)
+    self.quads.push(Quad { rect: vec4(r.x, r.y, r.w, r.h), color, clip, uv: m.origin, du: m.du, dv: m.dv, radius, border, soft, tex })
+    let cover = if opaque and color.w >= 1.0 { inside(r, radius).intersect(c).inner() } else { Rect {} }
+    self.covers.push(cover)
 }
 
 pub fn Canvas.rect(mut self, r: Rect, color: vec4) {
-    self.add(r, color, 0.0, 0.0, 0.0, no_texture, whole())
+    self.add(r, color, 0.0, 0.0, 0.0, no_texture, whole(), true)
 }
 
 pub fn Canvas.round_rect(mut self, r: Rect, color: vec4, radius: f32) {
-    self.add(r, color, radius, 0.0, 0.0, no_texture, whole())
+    self.add(r, color, radius, 0.0, 0.0, no_texture, whole(), true)
 }
 
 /// A `width`-pixel ring inside `r`.
 pub fn Canvas.border(mut self, r: Rect, color: vec4, radius: f32, width: f32) {
-    self.add(r, color, radius, width, 0.0, no_texture, whole())
+    self.add(r, color, radius, width, 0.0, no_texture, whole(), false)
 }
 
 /// A shadow of shape `r` blurred over `blur` pixels (it spreads that far
 /// outside `r`); draw it before the shape.
 pub fn Canvas.shadow(mut self, r: Rect, color: vec4, radius: f32, blur: f32) {
-    self.add(r.grow(blur), color, radius, 0.0, max(blur, 0.0), no_texture, whole())
+    self.add(r.grow(blur), color, radius, 0.0, max(blur, 0.0), no_texture, whole(), false)
 }
 
 /// Texture `t` stretched over `r`, with rounded corners.
 pub fn Canvas.image(mut self, t: gpu.Texture, r: Rect, opacity: f32, radius: f32) {
-    self.add(r, vec4(1.0, 1.0, 1.0, opacity), radius, 0.0, 0.0, t.index(), whole())
+    self.texture(t, r, Rect { w: 1.0, h: 1.0 }, Transform.Normal, vec4(1.0, 1.0, 1.0, opacity), radius)
 }
 
 /// Part `uv` (0..1) of texture `t` over `r`, multiplied by `tint`: atlas
 /// sprites.
 pub fn Canvas.image_part(mut self, t: gpu.Texture, r: Rect, uv: Rect, tint: vec4) {
-    self.add(r, tint, 0.0, 0.0, 0.0, t.index(), vec4(uv.x, uv.y, uv.x + uv.w, uv.y + uv.h))
+    self.texture(t, r, uv, Transform.Normal, tint, 0.0)
+}
+
+/// Part `src` (0..1 of the upright picture) of texture `t`, turned back by
+/// `turn`, over `r`, multiplied by `tint`, with rounded corners. An
+/// opaque texture (`Texture.opaque`) at full alpha hides what is under it.
+pub fn Canvas.texture(mut self, t: gpu.Texture, r: Rect, src: Rect, turn: Transform, tint: vec4, radius: f32) {
+    self.add(r, tint, radius, 0.0, 0.0, t.index(), transform.uv_map(src, turn), t.opaque())
+}
+
+/// The last shape is opaque over `r` (pixels) when at full alpha: shapes
+/// it hides are not drawn. Rectangles and opaque textures already are.
+pub fn Canvas.opaque(mut self, r: Rect) {
+    guard let Some(q) = self.quads.last() else {
+        return
+    }
+    guard q.color.w >= 1.0 else {
+        return
+    }
+    let shape = Rect { x: q.rect.x, y: q.rect.y, w: q.rect.z, h: q.rect.w }
+    let i = self.covers.len() - 1
+    self.covers[i] = inside(shape, q.radius).intersect(r).intersect(self.clip()).inner()
 }
 
 /// Clip later shapes to `r` (within the current clip) until `pop_clip`.
@@ -114,19 +171,22 @@ pub fn Canvas.pop_clip(mut self) {
     discard self.clips.pop()
 }
 
-/// Record the shapes into pass `p`. With `damage`, only that region is
-/// drawn (scissored, and shapes outside it are skipped): pass `Load.Keep`
-/// and redraw everything under the damage.
-pub fn Canvas.draw(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, p: gpu.Pass, damage: Option[Rect]) -> Result[(), str] {
-    let w = p.target.width()
-    let h = p.target.height()
-    let screen = Rect { w: f32(w), h: f32(h) }
-    let area = match damage {
-        Some(d) => d.intersect(screen)
-        None => screen
+/// Collect the shapes that show in `area`.
+fn Canvas.span(mut self, area: Rect) {
+    guard not area.is_empty() else {
+        return
     }
-    self.visible.clear()
-    for i in 0..self.quads.len() {
+    var first = 0
+    var k = self.quads.len() - 1
+    while k > 0 {
+        if self.covers[k].contains(area) {
+            first = k
+            break
+        }
+        k -= 1
+    }
+    let at = self.visible.len()
+    for i in first..self.quads.len() {
         let q = self.quads[i]
         let b = Rect { x: q.rect.x, y: q.rect.y, w: q.rect.z, h: q.rect.w }
         let c = Rect { x: q.clip.x, y: q.clip.y, w: q.clip.z - q.clip.x, h: q.clip.w - q.clip.y }
@@ -134,30 +194,48 @@ pub fn Canvas.draw(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, p: gpu.Pas
             self.visible.push(q)
         }
     }
-    let n = u32(self.visible.len())
-    guard n > 0 or p.load != gpu.Load.Keep else {
+    self.spans.push(Span { area, at, n: self.visible.len() - at })
+}
+
+/// Record the shapes into pass `p`. With `damage`, only those rectangles
+/// are drawn, all in the one pass: pass `Load.Keep` and redraw everything
+/// under the damage. Empty `damage` draws the whole target. When nothing
+/// reaches the damage of a `Keep` pass, no pass is recorded.
+pub fn Canvas.draw(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, p: gpu.Pass, damage: &[Rect]) -> Result[(), str] {
+    let w = p.target.width()
+    let h = p.target.height()
+    let screen = Rect { w: f32(w), h: f32(h) }
+    self.visible.clear()
+    self.spans.clear()
+    if damage.is_empty() {
+        self.span(screen)
+    }
+    for d in damage {
+        self.span(d.outer().intersect(screen))
+    }
+    guard not self.visible.is_empty() or p.load != gpu.Load.Keep else {
         return Ok(())
     }
     var addr: u64 = 0
-    if n > 0 {
+    if not self.visible.is_empty() {
         addr = (try dev.stage(bytes_of(self.visible))).addr()
     }
-    let push = Push { addr, size: vec2(f32(w), f32(h)) }
     let pipe = self.pipe
-    let x0 = area.x.floor()
-    let y0 = area.y.floor()
-    let x1 = (area.x + area.w).ceil()
-    let y1 = (area.y + area.h).ceil()
+    let size = vec2(f32(w), f32(h))
+    let spans = mem.replace(mut self.spans, [])
     e.render(p, fn(mut r) {
-        if damage.is_some() {
-            r.scissor(i32(x0), i32(y0), u32(x1 - x0), u32(y1 - y0))
-        }
-        if n > 0 {
-            r.bind(pipe)
-            r.push(bytes_of(push))
-            r.draw(6, n)
+        r.bind(pipe)
+        for s in spans {
+            guard s.n > 0 else {
+                continue
+            }
+            let a = s.area
+            r.scissor(i32(a.x), i32(a.y), u32(a.w), u32(a.h))
+            r.push(bytes_of(Push { addr: addr + u64(s.at) * quad_size, size }))
+            r.draw(6, u32(s.n))
         }
     })
+    self.spans = spans
     return Ok(())
 }
 

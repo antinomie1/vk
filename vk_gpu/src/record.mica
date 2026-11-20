@@ -173,7 +173,7 @@ fn check(dev: device.Device, e: encoder.Encoder) -> Result[(), str] {
                     return Err("copy past the end of a buffer")
                 }
             }
-            Upload(s, t) => {
+            Upload(s, t, a) => {
                 discard try plain(dev, t, "upload")
             }
             Download(t, b) => {
@@ -297,12 +297,18 @@ fn load_op(l: encoder.Load) -> vk.AttachmentLoadOp {
     }
 }
 
-fn region(i: res.TexInfo, off: u64) -> vk.BufferImageCopy {
+fn region(i: res.TexInfo, off: u64, a: encoder.Area) -> vk.BufferImageCopy {
     return vk.BufferImageCopy {
         buffer_offset: off,
+        buffer_row_length: a.row,
         image_subresource: vk.ImageSubresourceLayers { aspect_mask: i.aspect, layer_count: 1 },
-        image_extent: vk.Extent3D { width: i.width, height: i.height, depth: 1 },
+        image_offset: vk.Offset3D { x: i32(a.x), y: i32(a.y) },
+        image_extent: vk.Extent3D { width: a.w, height: a.h, depth: 1 },
     }
+}
+
+fn all(i: res.TexInfo) -> encoder.Area {
+    return encoder.Area { x: 0, y: 0, w: i.width, h: i.height }
 }
 
 fn Rec.begin_pass(mut self, mut dev: device.Device, p: encoder.Pass) {
@@ -432,10 +438,10 @@ fn translate(mut dev: device.Device, e: encoder.Encoder, cb: vk.CommandBuffer) -
                 unsafe cx.cmd.copy_buffer(cb, s.buffer, dev.buffers.get(b.h).unwrap().raw, 1, Ptr.of(region))
                 r.wrote_buffers(vk.PipelineStageFlags2.ALL_TRANSFER, vk.AccessFlags2.TRANSFER_WRITE)
             }
-            Upload(s, t) => {
+            Upload(s, t, a) => {
                 r.use(mut dev, t, sync.Use.CopyDst)
                 r.flush(mut dev)
-                let reg = region(dev.textures.get(t.h).unwrap(), s.offset)
+                let reg = region(dev.textures.get(t.h).unwrap(), s.offset, a)
                 let image = dev.textures.get(t.h).unwrap().image
                 unsafe cx.cmd.copy_buffer_to_image(cb, s.buffer, image, vk.ImageLayout.TRANSFER_DST_OPTIMAL, 1, Ptr.of(reg))
                 r.publish(mut dev, t)
@@ -443,7 +449,8 @@ fn translate(mut dev: device.Device, e: encoder.Encoder, cb: vk.CommandBuffer) -
             Download(t, b) => {
                 r.use(mut dev, t, sync.Use.CopySrc)
                 r.flush(mut dev)
-                let reg = region(dev.textures.get(t.h).unwrap(), 0)
+                let i = dev.textures.get(t.h).unwrap()
+                let reg = region(i, 0, all(i))
                 let image = dev.textures.get(t.h).unwrap().image
                 unsafe cx.cmd.copy_image_to_buffer(cb, image, vk.ImageLayout.TRANSFER_SRC_OPTIMAL, dev.buffers.get(b.h).unwrap().raw, 1, Ptr.of(reg))
                 r.publish(mut dev, t)

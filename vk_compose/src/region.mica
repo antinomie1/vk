@@ -1,0 +1,84 @@
+// Damage as a few whole-pixel rectangles. A rectangle that overlaps
+// another merges with it; past `max_rects`, the two whose union adds the
+// least area merge. One scissored draw per rectangle redraws it.
+
+import vk_draw2d as draw2d
+
+type Rect = draw2d.Rect
+
+pub let max_rects = 8
+
+pub struct Region {
+    rects: List[Rect] = []
+}
+
+pub fn Region.new() -> Region {
+    return Region {}
+}
+
+pub fn Region.is_empty(self) -> bool {
+    return self.rects.is_empty()
+}
+
+pub fn Region.rects(self) -> &[Rect] {
+    return self.rects
+}
+
+pub fn Region.clear(mut self) {
+    self.rects.clear()
+}
+
+pub fn Region.overlaps(self, r: Rect) -> bool {
+    return self.rects.any(fn(e) => e.overlaps(r))
+}
+
+/// Add `r`, rounded out to whole pixels.
+pub fn Region.add(mut self, r: Rect) {
+    var a = r.outer()
+    guard not a.is_empty() else {
+        return
+    }
+    var i = 0
+    while i < self.rects.len() {
+        let e = self.rects[i]
+        if e.contains(a) {
+            return
+        }
+        if e.overlaps(a) {
+            a = a.union(e)
+            discard self.rects.remove(i)
+            i = 0
+        } else {
+            i += 1
+        }
+    }
+    self.rects.push(a)
+    guard self.rects.len() > max_rects else {
+        return
+    }
+    var bi = 0
+    var bj = 1
+    var best: f32 = 3.0e38
+    for i in 0..self.rects.len() {
+        for j in i + 1..self.rects.len() {
+            let x = self.rects[i]
+            let y = self.rects[j]
+            let waste = x.union(y).area() - x.area() - y.area()
+            if waste < best {
+                best = waste
+                bi = i
+                bj = j
+            }
+        }
+    }
+    let u = self.rects[bi].union(self.rects[bj])
+    discard self.rects.remove(bj)
+    discard self.rects.remove(bi)
+    self.add(u)
+}
+
+pub fn Region.add_region(mut self, o: Region) {
+    for r in o.rects {
+        self.add(r)
+    }
+}

@@ -144,3 +144,54 @@ test "uploads to device-local buffers and retirement" {
     dev.wait(dev.submit(dev.encoder().unwrap()).unwrap()).unwrap()
     assert_eq(dev.live(), 0)
 }
+
+test "rectangles upload from a strided image" {
+    guard let Some(d) = device() else {
+        return
+    }
+    var dev = d
+    let tex = dev.texture(gpu.TextureDesc { width: 4, height: 4 }).unwrap()
+    var black: List[u8] = []
+    for _ in 0..64 {
+        black.push(0)
+    }
+    // A 4x4 source with 24-byte rows (8 bytes of padding); texel (x, y)
+    // holds x, y, 7, 255.
+    var src: List[u8] = []
+    for y in 0..4 {
+        for x in 0..6 {
+            for b in [u8(x), u8(y), 7, 255] {
+                src.push(b)
+            }
+        }
+    }
+    var e = dev.encoder().unwrap()
+    dev.write_texture(mut e, tex, black).unwrap()
+    dev.write_texture_rect(mut e, tex, 1, 2, 2, 2, src, 24).unwrap()
+    discard dev.submit(take e).unwrap()
+    let px = dev.read_texture(tex).unwrap()
+    for y in 0..4 {
+        for x in 0..4 {
+            let i = (y * 4 + x) * 4
+            let inside = x >= 1 and x < 3 and y >= 2
+            let want = if inside { (u8(x), u8(y), u8(7), u8(255)) } else { (u8(0), u8(0), u8(0), u8(0)) }
+            assert_eq((px[i], px[i + 1], px[i + 2], px[i + 3]), want)
+        }
+    }
+    // Rectangles outside the texture or the data are errors.
+    var bad = dev.encoder().unwrap()
+    assert(dev.write_texture_rect(mut bad, tex, 3, 0, 2, 1, src, 24).is_err())
+    assert(dev.write_texture_rect(mut bad, tex, 0, 0, 4, 4, src[0..80], 24).is_err())
+    assert(dev.write_texture_rect(mut bad, tex, 0, 0, 4, 1, src, 8).is_err())
+    dev.cancel(take bad)
+}
+
+test "opaque textures are sampled only" {
+    guard let Some(d) = device() else {
+        return
+    }
+    var dev = d
+    let t = dev.texture(gpu.TextureDesc { width: 2, height: 2, opaque: true }).unwrap()
+    assert(t.opaque())
+    assert(dev.texture(gpu.TextureDesc { width: 2, height: 2, opaque: true, target: true }).is_err())
+}

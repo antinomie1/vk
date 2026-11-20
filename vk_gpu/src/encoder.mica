@@ -42,13 +42,23 @@ enum Cmd {
     Storage(res.Texture)
     /// Upload-ring bytes into a buffer: source, offset, target, offset, size.
     Copy(res.Staged, res.Buffer, u64, u64)
-    /// Upload-ring bytes into all of a texture.
-    Upload(res.Staged, res.Texture)
+    /// Upload-ring bytes into a rectangle of a texture.
+    Upload(res.Staged, res.Texture, Area)
     /// All of a texture into a buffer, tightly packed.
     Download(res.Texture, res.Buffer)
     Acquire(res.Texture)
     Release(res.Texture)
     Present(res.Texture)
+}
+
+/// A texel rectangle, and the length of the source rows in texels (0:
+/// tightly packed).
+struct Area {
+    x: u32
+    y: u32
+    w: u32
+    h: u32
+    row: u32 = 0
 }
 
 /// What an encoder records, recycled by the device between encoders.

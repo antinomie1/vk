@@ -104,7 +104,9 @@ descriptor sets, fences, layouts or barriers in user code.
 - Memory: 64 MiB blocks per type, first-fit with merging, dedicated over
   32 MiB; host-visible memory stays mapped; device-local uploads when the
   whole VRAM is mappable. An 8 MiB upload ring (`stage`, `write`,
-  `write_texture`) recycled by tickets. Encoder lists and command buffers
+  `write_texture`, `write_texture_rect`) recycled by tickets.
+  `write_texture_rect` copies a rectangle out of a strided image (a wl_shm
+  pool) and stages only the bytes it spans. Encoder lists and command buffers
   are reused, so steady-state frames allocate nothing.
 
 ```mica
@@ -131,7 +133,8 @@ out.destroy(mut dev)
 - Sharing: `export_dmabuf` / `import_dmabuf` (one plane, any DRM
   modifier, dedicated memory), `submit_sync_file` / `wait_sync_file`;
   imported textures pass between queue families with `e.acquire(t)` /
-  `e.release(t)`. Frames report their `age()` (buffer age); swapchain
+  `e.release(t)`. `opaque` (on `TextureDesc` and `Dmabuf`) makes alpha read
+  as 1 through the view's swizzle, for XRGB formats. Frames report their `age()` (buffer age); swapchain
   images keep their contents between presents, so partial redraws work.
 
 ### Safety
@@ -165,34 +168,51 @@ dmabufs.
 ## vk_draw2d
 
 `Canvas`: `rect`, `round_rect`, `border`, `shadow`, `image`, `image_part`
-(atlas sprites), `push_clip` / `pop_clip`, then `draw(dev, e, pass,
-damage)`.
+(atlas sprites), `texture` (crop and `Transform`), `opaque`, `push_clip` /
+`pop_clip`, then `draw(dev, e, pass, damage)`.
 
-- One instanced draw per target: shapes are 80-byte instances staged in the
+- One pass per target: shapes are 96-byte instances staged once in the
   upload ring and read by buffer address; textures by bindless index.
 - Every shape is one rounded-box distance field (antialiased edges, rings,
   shadow falloff), so corners and shadows cost what a plain quad costs.
-- With damage, the pass is scissored and shapes outside it are skipped; when
-  nothing reaches the damage no pass is recorded.
+  Texture coordinates are an affine map per shape, so crops and the eight
+  `wl_output.transform`s cost nothing extra.
+- Damage is a list of rectangles, each one scissored instanced draw of the
+  shapes that reach it, in the same pass; when nothing reaches the damage no
+  pass is recorded.
+- Occlusion: each rectangle starts at the topmost shape that hides all of
+  it. Rectangles at full alpha and opaque textures hide what is under them;
+  `opaque(r)` marks more. A full-screen opaque window draws one quad.
 - Premultiplied blending; colors straight alpha, `srgb()` for sRGB targets.
 
 Not yet: backdrop blur.
 
 ## vk_compose
 
-`Scene`: `add`, `set`, `get`, `commit` (client damage in buffer pixels),
-`raise`, `remove`, `resize`, `idle`, and `render(dev, canvas, e, frame)`.
+`Scene`: `add`, `set`, `get`, `commit` (client damage in texture pixels),
+`raise`, `place_above`, `remove`, `resize`, `damage`, `idle`, `visible`,
+`scanout`, `changed`, and `render(dev, canvas, e, frame)`.
 
-- Damage is the union of what moved, changed or appeared since the last
-  frame, widened by the target image's age from a 4-frame history; age 0
-  redraws everything. `idle()` says no frame is needed at all.
-- Views are textures (shm uploads or imported dmabufs) with opacity, corner
-  radius and drop shadow; imported ones are acquired and released around
-  the pass. Feed client fences to `dev.wait_sync_file`, hand release points
-  back with `dev.submit_sync_file`.
-
-Damage is one bounding rectangle per frame (simple, and the scissor is one
-rectangle anyway).
+- A `View` is a texture (an shm upload or an imported dmabuf; a solid color
+  is 1x1) with a place and size, a source crop (wp_viewport), a buffer
+  transform, opacity, corner radius, drop shadow and opaque region.
+- Damage is up to 8 whole-pixel rectangles: what moved, changed or appeared
+  since the last frame, widened by the target image's age from a 4-frame
+  history; age 0 redraws everything. Client damage is mapped through the
+  view's crop, transform and scale. A new texture alone damages nothing but
+  what `commit` reports.
+- Rendering skips what opaque views hide; `visible(id)` says whether a view
+  shows at all, so hidden clients can be throttled (no frame callbacks).
+- `idle()`: no frame is needed. `scanout()`: the one view that fills the
+  screen as it is, to put on a plane instead of rendering. `changed()`: what
+  the last frame changed (KMS `FB_DAMAGE_CLIPS`, a parent compositor's
+  damage).
+- Imported textures are acquired and released around the pass. Swap a
+  client's texture in once its acquire fence has signaled (poll the
+  sync_file in the event loop), so a slow client never holds up a frame;
+  hand release points back with `dev.submit_sync_file`.
+- Steady frames allocate nothing: regions, history and the canvas reuse
+  their lists.
 
 ## vk_graph
 
@@ -305,10 +325,13 @@ cd glfw_sys/src && mica bind /usr/include/GLFW/glfw3.h -D GLFW_INCLUDE_NONE --ha
 ```sh
 sheaf test -p vk_gpu   # headless on the real device: clear, draw, bindless sampling,
                        # compute through a buffer address, uploads, retirement,
+                       # strided rectangle uploads, opaque textures,
                        # dmabuf export/import with sync_file, frame age, and
                        # misuse (stale/foreign handles, bad commands) as errors
-sheaf test -p vk_draw2d   # shapes, clips, alpha, shadows, damage, read back
-sheaf test -p vk_compose  # moves, idle frames, stacking, an imported dmabuf window
+sheaf test -p vk_draw2d   # shapes, clips, alpha, shadows, transforms, crops,
+                          # occlusion, several damage rectangles, read back
+sheaf test -p vk_compose  # regions; moves, idle frames, client damage through
+                          # transforms, occlusion, stacking, dmabuf windows, scanout
 sheaf test -p vk_graph    # culling, order, pooling
 sheaf test -p glfw_sys    # the generated API against the real library
 sheaf test -p glfw        # windows and their handles

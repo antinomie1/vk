@@ -1,0 +1,60 @@
+// How a texture is turned on screen. The values are wl_output.transform's
+// and the meaning wl_surface.set_buffer_transform's: the texture holds the
+// picture turned by the transform (counterclockwise; flipped variants
+// mirror around the vertical axis first), and drawing shows it upright.
+
+import rect
+
+pub enum Transform: u32 {
+    Normal = 0
+    Rot90 = 1
+    Rot180 = 2
+    Rot270 = 3
+    Flipped = 4
+    Flipped90 = 5
+    Flipped180 = 6
+    Flipped270 = 7
+}
+
+/// 90 or 270 degrees: the texture's width runs down the screen.
+pub fn Transform.swaps(self) -> bool {
+    return u32(self) & 1 == 1
+}
+
+/// The texture point (0..1) shown at point `p` (0..1) of the picture.
+pub fn Transform.apply(self, p: vec2) -> vec2 {
+    return match self {
+        Rot90 => vec2(p.y, 1.0 - p.x)
+        Rot180 => vec2(1.0 - p.x, 1.0 - p.y)
+        Rot270 => vec2(1.0 - p.y, p.x)
+        Flipped => vec2(1.0 - p.x, p.y)
+        Flipped90 => vec2(p.y, p.x)
+        Flipped180 => vec2(p.x, 1.0 - p.y)
+        Flipped270 => vec2(1.0 - p.y, 1.0 - p.x)
+        _ => p
+    }
+}
+
+/// Texture coordinates across a shape: `origin + x * du + y * dv` at point
+/// x, y (0..1) of the shape.
+pub struct UvMap {
+    pub origin: vec2
+    pub du: vec2
+    pub dv: vec2
+}
+
+/// Part `src` of the upright picture (0..1 coordinates) of a texture
+/// turned by `t`.
+pub fn uv_map(src: rect.Rect, t: Transform) -> UvMap {
+    let o = t.apply(vec2(src.x, src.y))
+    let u = t.apply(vec2(src.x + src.w, src.y))
+    let v = t.apply(vec2(src.x, src.y + src.h))
+    return UvMap { origin: o, du: u - o, dv: v - o }
+}
+
+/// The shape point (0..1) showing texture point `uv`.
+pub fn UvMap.invert(self, uv: vec2) -> vec2 {
+    let d = uv - self.origin
+    let det = self.du.x * self.dv.y - self.du.y * self.dv.x
+    return vec2(d.x * self.dv.y - d.y * self.dv.x, self.du.x * d.y - self.du.y * d.x) / det
+}

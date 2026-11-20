@@ -1,13 +1,15 @@
 // A scene composited into a 32x32 offscreen target on the real device:
-// moves redraw only their damage, idle frames draw nothing, and a window
-// backed by an imported dmabuf is acquired, sampled and released.
+// moves redraw only their damage, idle frames draw nothing, a new buffer
+// redraws only its client's damage (mapped through transforms), opaque
+// views hide what is under them, and a window backed by an imported dmabuf
+// is acquired, sampled, released and offered for direct scanout.
 
 import vk_gpu as gpu
 import vk_draw2d as draw2d
 import vk_compose as compose
 
 fn solid(mut dev: gpu.Device, w: u32, h: u32, rgba: [4]u8) -> gpu.Texture {
-    let t = dev.texture(gpu.TextureDesc { width: w, height: h }).unwrap()
+    let t = dev.texture(gpu.TextureDesc { width: w, height: h, opaque: rgba[3] == 255 }).unwrap()
     var data: List[u8] = []
     for _ in 0..int(w * h) {
         for b in rgba {
@@ -98,4 +100,121 @@ test "an imported dmabuf window" {
     let (_, img) = frame(mut dev, mut c, mut s, mut out)
     assert_eq(px(img, 12, 12), (u8(0), u8(255), u8(0), u8(255)))
     assert_eq(px(img, 30, 30), black)
+}
+
+fn setup() -> Option[(gpu.Device, gpu.Offscreen, draw2d.Canvas)] {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return None
+    }
+    var dev = d
+    let out = gpu.Offscreen.create(mut dev, 32, 32, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    let c = draw2d.Canvas.create(mut dev, gpu.Format.R8G8B8A8_UNORM).unwrap()
+    return Some((dev, out, c))
+}
+
+let blue = (u8(0), u8(0), u8(255), u8(255))
+
+test "a new buffer redraws only the client's damage" {
+    guard let Some((d, o, cv)) = setup() else {
+        return
+    }
+    var dev = d
+    var out = o
+    var c = cv
+    var s = compose.Scene.new(32, 32, vec4(0.0, 0.0, 0.0, 1.0))
+    let id = s.add(compose.View { tex: solid(mut dev, 8, 8, [255, 0, 0, 255]) })
+    discard frame(mut dev, mut c, mut s, mut out)
+    var v = s.get(id).unwrap()
+    v.tex = solid(mut dev, 8, 8, [0, 0, 255, 255])
+    s.set(id, v)
+    assert(s.idle())
+    s.commit(id, Some(compose.Rect { w: 2.0, h: 2.0 }))
+    let (_, img) = frame(mut dev, mut c, mut s, mut out)
+    assert_eq(s.changed().len(), 1)
+    assert_eq(s.changed()[0], compose.Rect { w: 3.0, h: 3.0 })
+    assert_eq(px(img, 1, 1), blue)
+    assert_eq(px(img, 6, 6), red)
+}
+
+test "client damage maps through the transform and scale" {
+    guard let Some((d, o, cv)) = setup() else {
+        return
+    }
+    var dev = d
+    var out = o
+    var c = cv
+    var s = compose.Scene.new(32, 32, vec4(0.0, 0.0, 0.0, 1.0))
+    // A 4x2 buffer turned 90 degrees is 2x4 upright, shown at 8x16.
+    let id = s.add(compose.View { tex: solid(mut dev, 4, 2, [255, 0, 0, 255]), w: 8.0, h: 16.0, transform: compose.Transform.Rot90 })
+    discard frame(mut dev, mut c, mut s, mut out)
+    // Its first texel shows at the top right: x 4..8, y 0..4, plus a pixel.
+    s.commit(id, Some(compose.Rect { w: 1.0, h: 1.0 }))
+    discard frame(mut dev, mut c, mut s, mut out)
+    assert_eq(s.changed().len(), 1)
+    assert_eq(s.changed()[0], compose.Rect { x: 3.0, y: 0.0, w: 5.0, h: 5.0 })
+}
+
+test "opaque views hide what is under them" {
+    guard let Some((d, o, cv)) = setup() else {
+        return
+    }
+    var dev = d
+    var s = compose.Scene.new(32, 32, vec4(0.0, 0.0, 0.0, 1.0))
+    let below = s.add(compose.View { tex: solid(mut dev, 8, 8, [255, 0, 0, 255]), x: 4.0, y: 4.0 })
+    let top = s.add(compose.View { tex: solid(mut dev, 16, 16, [0, 0, 255, 255]) })
+    assert(not s.visible(below))
+    assert(s.visible(top))
+    var v = s.get(top).unwrap()
+    v.opacity = 0.5
+    s.set(top, v)
+    assert(s.visible(below))
+    // Translucent texels, with an opaque region over all of them.
+    v = compose.View { tex: solid(mut dev, 16, 16, [0, 0, 255, 128]), opaque: compose.Rect { w: 16.0, h: 16.0 } }
+    s.set(top, v)
+    assert(not s.visible(below))
+    v.x = 8.0
+    s.set(top, v)
+    assert(s.visible(below))
+    // Off screen is not visible.
+    s.set(below, compose.View { tex: solid(mut dev, 8, 8, [255, 0, 0, 255]), x: 40.0 })
+    assert(not s.visible(below))
+}
+
+test "stacking order" {
+    guard let Some((d, o, cv)) = setup() else {
+        return
+    }
+    var dev = d
+    var out = o
+    var c = cv
+    var s = compose.Scene.new(32, 32, vec4(0.0, 0.0, 0.0, 1.0))
+    let a = s.add(compose.View { tex: solid(mut dev, 32, 32, [255, 0, 0, 255]) })
+    let b = s.add(compose.View { tex: solid(mut dev, 32, 32, [0, 0, 255, 255]) })
+    let (_, one) = frame(mut dev, mut c, mut s, mut out)
+    assert_eq(px(one, 5, 5), blue)
+    s.place_above(b, 0)
+    let (_, two) = frame(mut dev, mut c, mut s, mut out)
+    assert_eq(px(two, 5, 5), red)
+    s.place_above(b, a)
+    let (_, three) = frame(mut dev, mut c, mut s, mut out)
+    assert_eq(px(three, 5, 5), blue)
+}
+
+test "a full-screen imported window is offered for scanout" {
+    guard let Some((d, o, cv)) = setup() else {
+        return
+    }
+    var dev = d
+    guard let Ok((client, buf)) = dev.export_dmabuf(gpu.TextureDesc { width: 32, height: 32 }) else {
+        return
+    }
+    let tex = dev.import_dmabuf(gpu.Dmabuf { opaque: true, ..buf }).unwrap()
+    var s = compose.Scene.new(32, 32, vec4(0.0, 0.0, 0.0, 1.0))
+    let id = s.add(compose.View { tex })
+    assert_eq(s.scanout(), Some(id))
+    let cursor = s.add(compose.View { tex: solid(mut dev, 4, 4, [255, 255, 255, 255]) })
+    assert_eq(s.scanout(), None)
+    s.remove(cursor)
+    s.set(id, compose.View { tex, w: 16.0, h: 16.0 })
+    assert_eq(s.scanout(), None)
 }

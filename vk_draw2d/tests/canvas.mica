@@ -18,7 +18,11 @@ fn fx() -> Option[(gpu.Device, draw2d.Canvas, gpu.Texture)] {
 fn frame(mut dev: gpu.Device, mut c: draw2d.Canvas, tex: gpu.Texture, damage: Option[draw2d.Rect]) -> List[u8] {
     var e = dev.encoder().unwrap()
     let load = if damage.is_some() { gpu.Load.Keep } else { gpu.Load.Clear }
-    c.draw(mut dev, mut e, gpu.Pass { target: tex, load }, damage).unwrap()
+    var rects: List[draw2d.Rect] = []
+    if let Some(d) = damage {
+        rects.push(d)
+    }
+    c.draw(mut dev, mut e, gpu.Pass { target: tex, load }, rects).unwrap()
     discard dev.submit(take e).unwrap()
     c.clear()
     return dev.read_texture(tex).unwrap()
@@ -125,4 +129,102 @@ test "srgb converts to linear" {
     let c = draw2d.srgb(1.0, 0.5, 0.0, 1.0)
     assert(c.x == 1.0 and c.z == 0.0)
     assert(c.y > 0.21 and c.y < 0.22)
+}
+
+/// A w x h texture of `texels` (RGBA8, row by row).
+fn texture(mut dev: gpu.Device, w: u32, h: u32, texels: List[u8], opaque: bool) -> gpu.Texture {
+    let t = dev.texture(gpu.TextureDesc { width: w, height: h, opaque }).unwrap()
+    var e = dev.encoder().unwrap()
+    dev.write_texture(mut e, t, texels).unwrap()
+    discard dev.submit(take e).unwrap()
+    return t
+}
+
+let green = (u8(0), u8(255), u8(0), u8(255))
+
+test "transforms and source rectangles" {
+    guard let Some((d, c, tex)) = fx() else {
+        return
+    }
+    var dev = d
+    var canvas = c
+    // Red then green, left to right.
+    let t = texture(mut dev, 2, 1, [255, 0, 0, 255, 0, 255, 0, 255], false)
+    let all = draw2d.Rect { w: 1.0, h: 1.0 }
+    // Turned 90 degrees: the picture is red over green.
+    canvas.texture(t, full(), all, draw2d.Transform.Rot90, vec4(1.0), 0.0)
+    var img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 8, 2), red)
+    assert_eq(px(img, 8, 13), green)
+    canvas.texture(t, full(), all, draw2d.Transform.Rot270, vec4(1.0), 0.0)
+    img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 8, 2), green)
+    assert_eq(px(img, 8, 13), red)
+    canvas.texture(t, full(), all, draw2d.Transform.Flipped, vec4(1.0), 0.0)
+    img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 2, 8), green)
+    assert_eq(px(img, 13, 8), red)
+    // Of red, red, green, green, the right half alone: green where the
+    // whole texture shows red.
+    let wide = texture(mut dev, 4, 1, [255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255], false)
+    canvas.texture(wide, full(), draw2d.Rect { x: 0.5, w: 0.5, h: 1.0 }, draw2d.Transform.Normal, vec4(1.0), 0.0)
+    img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 5, 8), green)
+    assert_eq(px(img, 14, 8), green)
+    // Mapping back: the texel at u = 0.25 shows at the top under Rot90.
+    let m = draw2d.transform.uv_map(all, draw2d.Transform.Rot90)
+    let p = m.invert(vec2(0.25, 0.5))
+    assert(p.x == 0.5 and p.y == 0.25)
+}
+
+test "opaque shapes hide what is under them" {
+    guard let Some((d, c, tex)) = fx() else {
+        return
+    }
+    var dev = d
+    var canvas = c
+    canvas.rect(full(), vec4(0.0, 0.0, 0.0, 1.0))
+    discard frame(mut dev, mut canvas, tex, None)
+    // An opaque texture whose alpha says 0 still shows.
+    let blank = texture(mut dev, 1, 1, [0, 0, 255, 0], true)
+    canvas.image(blank, full(), 1.0, 0.0)
+    var img = frame(mut dev, mut canvas, tex, None)
+    assert_eq(px(img, 8, 8), blue)
+    // Half-transparent white claimed opaque: the red under it is not
+    // drawn, so it blends with what the image held (blue).
+    let white = texture(mut dev, 1, 1, [128, 128, 128, 128], false)
+    canvas.rect(full(), vec4(1.0, 0.0, 0.0, 1.0))
+    canvas.image(white, full(), 1.0, 0.0)
+    canvas.opaque(full())
+    img = frame(mut dev, mut canvas, tex, Some(full()))
+    let (r, g, b, a) = px(img, 8, 8)
+    assert(r > 120 and r < 135 and g > 120 and g < 135 and b > 250)
+    // Without the claim the red is drawn first.
+    canvas.rect(full(), vec4(1.0, 0.0, 0.0, 1.0))
+    canvas.image(white, full(), 1.0, 0.0)
+    img = frame(mut dev, mut canvas, tex, Some(full()))
+    let (r2, g2, b2, a2) = px(img, 8, 8)
+    assert(r2 > 250 and b2 < 135)
+}
+
+test "several damage rectangles in one pass" {
+    guard let Some((d, c, tex)) = fx() else {
+        return
+    }
+    var dev = d
+    var canvas = c
+    canvas.rect(full(), vec4(1.0, 0.0, 0.0, 1.0))
+    discard frame(mut dev, mut canvas, tex, None)
+    canvas.rect(full(), vec4(0.0, 0.0, 1.0, 1.0))
+    var e = dev.encoder().unwrap()
+    let rects = [draw2d.Rect { w: 4.0, h: 4.0 }, draw2d.Rect { x: 10.5, y: 10.5, w: 2.0, h: 2.0 }]
+    canvas.draw(mut dev, mut e, gpu.Pass { target: tex, load: gpu.Load.Keep }, rects).unwrap()
+    discard dev.submit(take e).unwrap()
+    let img = dev.read_texture(tex).unwrap()
+    assert_eq(px(img, 1, 1), blue)
+    assert_eq(px(img, 6, 6), red)
+    // Rounded out to whole pixels: 10..13.
+    assert_eq(px(img, 10, 10), blue)
+    assert_eq(px(img, 12, 12), blue)
+    assert_eq(px(img, 13, 13), red)
 }

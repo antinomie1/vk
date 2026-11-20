@@ -92,7 +92,9 @@ framebuffer、描述符集、fence、布局和屏障。
   并行；FIFO 或 mailbox/immediate。
 - 内存：每种类型 64 MiB 块，首次适配并合并空闲段，超过 32 MiB 单独分配；
   主机可见内存常驻映射；整块显存可映射时上传直接写显存。8 MiB 上传环
-  （`stage`、`write`、`write_texture`）按 Ticket 回收。Encoder 列表和命令缓冲
+  （`stage`、`write`、`write_texture`、`write_texture_rect`）按 Ticket 回收。
+  `write_texture_rect` 从带行跨度的图像（wl_shm 池）中拷贝一个矩形，只暂存它
+  覆盖的字节。Encoder 列表和命令缓冲
   都复用，稳态帧不分配内存。
 
 ```mica
@@ -118,7 +120,8 @@ out.destroy(mut dev)
 
 - 共享：`export_dmabuf` / `import_dmabuf`（单平面，任意 DRM 修饰符，专用内存），
   `submit_sync_file` / `wait_sync_file`；导入的纹理用 `e.acquire(t)` /
-  `e.release(t)` 在队列族之间交接所有权。帧通过 `age()` 报告缓冲年龄；交换链
+  `e.release(t)` 在队列族之间交接所有权。`TextureDesc` 和 `Dmabuf` 的
+  `opaque` 通过视图的分量重排让 alpha 读作 1，用于 XRGB 格式。帧通过 `age()` 报告缓冲年龄；交换链
   图像在两次呈现之间保留内容，因此可以局部重绘。
 
 ### 安全性
@@ -145,29 +148,43 @@ out.destroy(mut dev)
 ## vk_draw2d
 
 `Canvas`：`rect`、`round_rect`、`border`、`shadow`、`image`、`image_part`
-（图集中的精灵）、`push_clip` / `pop_clip`，然后 `draw(dev, e, pass, damage)`。
+（图集中的精灵）、`texture`（裁剪与 `Transform`）、`opaque`、`push_clip` /
+`pop_clip`，然后 `draw(dev, e, pass, damage)`。
 
-- 每个目标一次实例化绘制：形状是 80 字节的实例，放进上传环，按缓冲地址读取；
+- 每个目标一个 pass：形状是 96 字节的实例，一次放进上传环，按缓冲地址读取；
   纹理按 bindless 下标读取。
 - 每个形状都是同一个圆角盒距离场（抗锯齿边缘、圆环、阴影衰减），所以圆角和
-  阴影的开销与普通矩形相同。
-- 传入损坏区域时 pass 被裁剪，区域外的形状被跳过；没有形状落入时不录制 pass。
+  阴影的开销与普通矩形相同。纹理坐标是每个形状的仿射映射，裁剪和八种
+  `wl_output.transform` 不增加开销。
+- 损坏区域是一组矩形，每个矩形在同一个 pass 里做一次带裁剪的实例化绘制，只画
+  落入它的形状；没有形状落入时不录制 pass。
+- 遮挡剔除：每个矩形从完全盖住它的最上层形状开始画。满 alpha 的矩形和不透明
+  纹理会遮住下面的内容，`opaque(r)` 可以再标记。全屏不透明窗口只画一个四边形。
 - 预乘 alpha 混合；颜色用非预乘 alpha，sRGB 目标用 `srgb()`。
 
 尚未实现：背景模糊。
 
 ## vk_compose
 
-`Scene`：`add`、`set`、`get`、`commit`（客户端损坏区域，单位为缓冲像素）、
-`raise`、`remove`、`resize`、`idle`，以及 `render(dev, canvas, e, frame)`。
+`Scene`：`add`、`set`、`get`、`commit`（客户端损坏区域，单位为纹理像素）、
+`raise`、`place_above`、`remove`、`resize`、`damage`、`idle`、`visible`、
+`scanout`、`changed`，以及 `render(dev, canvas, e, frame)`。
 
-- 损坏区域是自上一帧以来移动、变化或出现的部分之并，再按目标图像的年龄并上
-  最近 4 帧的历史；年龄为 0 时全部重绘。`idle()` 表示根本不需要新的一帧。
-- 视图是纹理（shm 上传或导入的 dmabuf），带不透明度、圆角和投影；导入的纹理
-  在 pass 前后自动取回和归还。客户端的栅栏交给 `dev.wait_sync_file`，释放点用
+- `View` 是一张纹理（shm 上传或导入的 dmabuf；纯色用 1x1 纹理），带位置和
+  尺寸、源裁剪（wp_viewport）、缓冲变换、不透明度、圆角、投影和不透明区域。
+- 损坏区域最多 8 个整像素矩形：自上一帧以来移动、变化或出现的部分，再按目标
+  图像的年龄并上最近 4 帧的历史；年龄为 0 时全部重绘。客户端损坏区域会经过
+  视图的裁剪、变换和缩放映射到屏幕。只换纹理不产生损坏，只重绘 `commit` 报告
+  的部分。
+- 渲染跳过被不透明视图遮住的内容；`visible(id)` 表示视图是否还能看到，被遮住
+  的客户端可以降频（不发帧回调）。
+- `idle()`：不需要新的一帧。`scanout()`：原样铺满屏幕的那个视图，可以直接放到
+  plane 上而不渲染。`changed()`：上一帧改变的区域（KMS `FB_DAMAGE_CLIPS`、
+  上级合成器的损坏区域）。
+- 导入的纹理在 pass 前后自动取回和归还。客户端的获取栅栏在事件循环中轮询，
+  发出信号后再用 `set` 换入纹理，慢客户端不会拖住任何一帧；释放点用
   `dev.submit_sync_file` 返回。
-
-每帧的损坏区域是一个包围矩形（简单，裁剪本来也只有一个矩形）。
+- 稳态帧不分配内存：区域、历史和画布都复用各自的列表。
 
 ## vk_graph
 
@@ -270,10 +287,13 @@ cd glfw_sys/src && mica bind /usr/include/GLFW/glfw3.h -D GLFW_INCLUDE_NONE --ha
 ```sh
 sheaf test -p vk_gpu      # 在真实设备上无头运行：清屏、绘制、bindless 采样、
                           # 通过缓冲地址的 compute、上传、回收、
+                          # 带行跨度的矩形上传、不透明纹理、
                           # dmabuf 导出导入与 sync_file、帧年龄，
                           # 以及误用（失效/外部句柄、非法命令）报错
-sheaf test -p vk_draw2d   # 形状、裁剪、透明、阴影、损坏区域，读回比对
-sheaf test -p vk_compose  # 移动、空闲帧、层叠、导入 dmabuf 的窗口
+sheaf test -p vk_draw2d   # 形状、裁剪、透明、阴影、变换、源裁剪、遮挡、
+                          # 多个损坏矩形，读回比对
+sheaf test -p vk_compose  # 区域；移动、空闲帧、经变换映射的客户端损坏、遮挡、
+                          # 层叠、dmabuf 窗口、直接扫描输出
 sheaf test -p vk_graph    # 剔除、顺序、池化
 sheaf test -p glfw_sys    # 生成的 API 对真实库的调用
 sheaf test -p glfw        # 窗口及其句柄

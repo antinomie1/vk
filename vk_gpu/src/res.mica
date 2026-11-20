@@ -19,6 +19,7 @@ pub struct Texture {
     format: vk.Format
     /// Imported: owned by its producer between `acquire` and `release`.
     ext: bool = false
+    opaque: bool = false
 }
 
 /// Bindless slot; a destroyed texture's slot samples transparent black.
@@ -36,6 +37,11 @@ pub fn Texture.height(self) -> u32 {
 
 pub fn Texture.format(self) -> vk.Format {
     return self.format
+}
+
+/// Alpha reads as 1 (`TextureDesc.opaque`, `Dmabuf.opaque`).
+pub fn Texture.opaque(self) -> bool {
+    return self.opaque
 }
 
 /// Imported from another process (`Device.import_dmabuf`).
@@ -91,6 +97,9 @@ pub struct TextureDesc {
     pub target: bool = false
     /// Written with imageStore (binding 2).
     pub storage: bool = false
+    /// Alpha reads as 1 whatever the texels hold (XRGB formats); sampled
+    /// only, not with `target` or `storage`.
+    pub opaque: bool = false
 }
 
 struct TexInfo {
@@ -111,6 +120,7 @@ struct TexInfo {
     target: bool = false
     storage: bool = false
     copy: bool = true
+    opaque: bool = false
     /// Destroyed: rejected by every check, freed once the GPU is done.
     dead: bool = false
 }
@@ -150,11 +160,14 @@ fn texel_size(f: vk.Format) -> u64 {
     }
 }
 
-fn view(cx: ctx.Ctx, image: vk.Image, format: vk.Format) -> Result[vk.ImageView, str] {
+/// A view of all of `image`; `opaque` swizzles alpha to 1.
+fn view(cx: ctx.Ctx, image: vk.Image, format: vk.Format, opaque: bool) -> Result[vk.ImageView, str] {
+    let one = vk.ComponentSwizzle.ONE
     let info = vk.ImageViewCreateInfo {
         image,
         view_type: vk.ImageViewType.TYPE_2D,
         format,
+        components: if opaque { vk.ComponentMapping { a: one } } else { vk.ComponentMapping {} },
         subresource_range: vk.ImageSubresourceRange { aspect_mask: aspect(format), level_count: 1, layer_count: 1 },
     }
     var v = vk.ImageView {}
@@ -196,7 +209,7 @@ fn create_texture(cx: ctx.Ctx, mut mem: alloc.Allocator, d: TextureDesc) -> Resu
         }
     }
     try ctx.ok(cx.fns.bind_image_memory(cx.device, image, a.memory, a.offset), "vkBindImageMemory")
-    let v = try view(cx, image, d.format)
+    let v = try view(cx, image, d.format, d.opaque)
     return Ok(TexInfo {
         image,
         view: v,
@@ -209,6 +222,7 @@ fn create_texture(cx: ctx.Ctx, mut mem: alloc.Allocator, d: TextureDesc) -> Resu
         aspect: aspect(d.format),
         target: d.target,
         storage: d.storage,
+        opaque: d.opaque,
     })
 }
 

@@ -4,13 +4,16 @@
 
 struct Quad {
     vec4 rect;   // x, y, w, h
-    vec4 uv;     // u0, v0, u1, v1
     vec4 color;  // straight alpha; multiplies the texel
     vec4 clip;   // x0, y0, x1, y1
+    vec2 uv;     // texture coordinates at the top left corner,
+    vec2 du;     // their change across the width,
+    vec2 dv;     // and down the height
     float radius;
     float border; // ring width; 0 fills
     float soft;   // edge falloff in pixels (shadows); 0 is antialiased
     uint tex;     // bindless index; 0xFFFFFFFF for none
+    vec2 pad;     // 96-byte stride
 };
 
 layout(buffer_reference, std430) readonly buffer Quads { Quad q[]; };

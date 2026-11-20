@@ -1,0 +1,41 @@
+// Damage regions: whole pixels, merging overlaps, a bounded length.
+
+import vk_compose as compose
+
+fn r(x: f32, y: f32, w: f32, h: f32) -> compose.Rect {
+    return compose.Rect { x, y, w, h }
+}
+
+test "rectangles round out and overlaps merge" {
+    var g = compose.Region.new()
+    g.add(r(0.5, 0.5, 2.0, 2.0))
+    assert_eq(g.rects()[0], r(0.0, 0.0, 3.0, 3.0))
+    g.add(r(1.0, 1.0, 1.0, 1.0))
+    assert_eq(g.rects().len(), 1)
+    g.add(r(2.0, 2.0, 4.0, 4.0))
+    assert_eq(g.rects().len(), 1)
+    assert_eq(g.rects()[0], r(0.0, 0.0, 6.0, 6.0))
+    g.add(r(10.0, 0.0, 2.0, 2.0))
+    assert_eq(g.rects().len(), 2)
+    assert(g.overlaps(r(11.0, 1.0, 1.0, 1.0)))
+    assert(not g.overlaps(r(7.0, 7.0, 1.0, 1.0)))
+    g.add(r(0.0, 0.0, 0.0, 5.0))
+    assert_eq(g.rects().len(), 2)
+}
+
+test "a region stays short" {
+    var g = compose.Region.new()
+    for i in 0..20 {
+        g.add(r(f32(i * 10), 0.0, 2.0, 2.0))
+    }
+    assert(g.rects().len() <= compose.region.max_rects)
+    // Everything added is still covered.
+    for i in 0..20 {
+        let p = r(f32(i * 10), 0.0, 2.0, 2.0)
+        var held = false
+        for e in g.rects() {
+            held = held or e.contains(p)
+        }
+        assert(held)
+    }
+}

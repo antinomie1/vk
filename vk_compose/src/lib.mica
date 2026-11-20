@@ -1,37 +1,83 @@
 // vk_compose: a compositor's frame. Windows are views over textures (shm
 // uploads or imported dmabufs) stacked back to front. The scene turns what
-// changed since the last frame into damage, widens it by the target image's
-// age (older images missed the damage of the frames since), and redraws
-// only that region with vk_draw2d; imported textures are acquired from and
+// changed since the last frame into damage (a few rectangles), widens it
+// by the target image's age (older images missed the damage of the frames
+// since), and redraws only that with vk_draw2d, in one pass, skipping
+// whatever an opaque view hides. Imported textures are acquired from and
 // released to their clients around the pass.
 
+import std.mem
 import vk_gpu as gpu
 import vk_draw2d as draw2d
+pub import region
 
 pub type Rect = draw2d.Rect
+pub type Transform = draw2d.Transform
+pub type Region = region.Region
 
 pub struct View {
+    /// What it shows. A solid color is a 1x1 texture.
     pub tex: gpu.Texture
     pub x: f32 = 0.0
     pub y: f32 = 0.0
-    /// Size on screen; 0 means the texture's size.
+    /// Size on screen; 0 means the size of `src`.
     pub w: f32 = 0.0
     pub h: f32 = 0.0
+    /// The part shown, in pixels of the upright picture (the texture turned
+    /// back by `transform`); empty means all of it (wp_viewport source).
+    pub src: Rect = Rect {}
+    /// How the texture is turned (wl_surface.set_buffer_transform).
+    pub transform: Transform = Transform.Normal
     pub opacity: f32 = 1.0
     pub radius: f32 = 0.0
     /// Drop shadow blur in pixels; 0 for none.
     pub shadow: f32 = 0.0
+    /// Where it is opaque, relative to `x, y` in screen pixels
+    /// (wl_surface.set_opaque_region); an opaque texture
+    /// (`TextureDesc.opaque`, `Dmabuf.opaque`) is opaque everywhere.
+    /// Nothing it hides is drawn.
+    pub opaque: Rect = Rect {}
 }
 
-/// Where `v` covers the screen, shadow included.
+/// The texture's size turned upright.
+fn View.picture(self) -> vec2 {
+    let w = f32(self.tex.width())
+    let h = f32(self.tex.height())
+    return if self.transform.swaps() { vec2(h, w) } else { vec2(w, h) }
+}
+
+/// `src` in 0..1 of the picture.
+fn View.part(self) -> Rect {
+    guard not self.src.is_empty() else {
+        return Rect { w: 1.0, h: 1.0 }
+    }
+    let p = self.picture()
+    return Rect { x: self.src.x / p.x, y: self.src.y / p.y, w: self.src.w / p.x, h: self.src.h / p.y }
+}
+
+/// Where `v` covers the screen, shadow excluded.
 fn View.rect(self) -> Rect {
-    let w = if self.w > 0.0 { self.w } else { f32(self.tex.width()) }
-    let h = if self.h > 0.0 { self.h } else { f32(self.tex.height()) }
+    let size = if self.src.is_empty() { self.picture() } else { vec2(self.src.w, self.src.h) }
+    let w = if self.w > 0.0 { self.w } else { size.x }
+    let h = if self.h > 0.0 { self.h } else { size.y }
     return Rect { x: self.x, y: self.y, w, h }
 }
 
 fn View.bounds(self) -> Rect {
     return self.rect().grow(self.shadow)
+}
+
+/// Where it hides what is under it, in whole pixels.
+fn View.cover(self) -> Rect {
+    guard self.opacity >= 1.0 else {
+        return Rect {}
+    }
+    let r = self.rect()
+    var o = if self.tex.opaque() { r } else { Rect { x: self.x + self.opaque.x, y: self.y + self.opaque.y, w: self.opaque.w, h: self.opaque.h }.intersect(r) }
+    if self.radius > 0.0 {
+        o = o.intersect(r.grow(-0.293 * self.radius))
+    }
+    return o.inner()
 }
 
 struct Entry {
@@ -49,16 +95,30 @@ pub struct Scene {
     entries: List[Entry] = []
     next: u32 = 1
     /// Damage since the last `render`.
-    pending: Rect = Rect {}
-    history: List[Rect] = []
+    pending: Region = Region {}
+    /// Never empty: frame 0 changed nothing.
+    history: List[Region]
+    /// Scratch: what `render` redraws.
+    area: Region = Region {}
 }
 
 pub fn Scene.new(width: u32, height: u32, background: vec4) -> Scene {
-    return Scene { width: f32(width), height: f32(height), background, pending: Rect { w: f32(width), h: f32(height) } }
+    var s = Scene { width: f32(width), height: f32(height), background, history: [Region {}] }
+    s.damage_all()
+    return s
 }
 
-fn Scene.damage(mut self, r: Rect) {
-    self.pending = self.pending.union(r)
+fn Scene.screen(self) -> Rect {
+    return Rect { w: self.width, h: self.height }
+}
+
+/// Redraw `r` (screen pixels) next frame.
+pub fn Scene.damage(mut self, r: Rect) {
+    self.pending.add(r.intersect(self.screen()))
+}
+
+pub fn Scene.damage_all(mut self) {
+    self.damage(self.screen())
 }
 
 fn Scene.find(self, id: u32) -> int {
@@ -74,15 +134,21 @@ pub fn Scene.add(mut self, v: View) -> u32 {
     return id
 }
 
-/// Move, resize, restyle or give `id` a new buffer.
+/// Move, resize, restyle or give `id` a new texture. A new texture alone
+/// (same size, place and style) damages nothing: say what the client drew
+/// with `commit`.
 pub fn Scene.set(mut self, id: u32, v: View) {
     let i = self.find(id)
     guard i >= 0 else {
         return
     }
-    self.damage(self.entries[i].view.bounds())
-    self.damage(v.bounds())
+    let old = self.entries[i].view
     self.entries[i] = Entry { id, view: v }
+    let same = View { tex: old.tex, ..v } == old and v.rect() == old.rect() and v.tex.opaque() == old.tex.opaque()
+    if not same {
+        self.damage(old.bounds())
+        self.damage(v.bounds())
+    }
 }
 
 pub fn Scene.get(self, id: u32) -> Option[View] {
@@ -90,7 +156,7 @@ pub fn Scene.get(self, id: u32) -> Option[View] {
     return if i < 0 { None } else { Some(self.entries[i].view) }
 }
 
-/// The client drew into `id`'s buffer: `area` in buffer pixels, or all.
+/// The client drew into `id`'s texture: `area` in texture pixels, or all.
 pub fn Scene.commit(mut self, id: u32, area: Option[Rect]) {
     let i = self.find(id)
     guard i >= 0 else {
@@ -102,9 +168,17 @@ pub fn Scene.commit(mut self, id: u32, area: Option[Rect]) {
         self.damage(r)
         return
     }
-    let sx = r.w / f32(v.tex.width())
-    let sy = r.h / f32(v.tex.height())
-    self.damage(Rect { x: r.x + a.x * sx, y: r.y + a.y * sy, w: a.w * sx, h: a.h * sy }.grow(1.0))
+    // Texture pixels to 0..1 of the view, through the transform and crop.
+    let m = draw2d.transform.uv_map(v.part(), v.transform)
+    let tw = f32(v.tex.width())
+    let th = f32(v.tex.height())
+    let p = m.invert(vec2(a.x / tw, a.y / th))
+    let q = m.invert(vec2((a.x + a.w) / tw, (a.y + a.h) / th))
+    let x0 = min(p.x, q.x)
+    let y0 = min(p.y, q.y)
+    let d = Rect { x: r.x + x0 * r.w, y: r.y + y0 * r.h, w: (max(p.x, q.x) - x0) * r.w, h: (max(p.y, q.y) - y0) * r.h }
+    // Filtering reads a texel past the edge when scaled.
+    self.damage(d.grow(1.0).intersect(r))
 }
 
 pub fn Scene.remove(mut self, id: u32) {
@@ -127,14 +201,27 @@ pub fn Scene.raise(mut self, id: u32) {
     self.entries.push(e)
 }
 
+/// Move `id` right above `other`, or to the bottom when `other` is 0
+/// (subsurfaces, popups).
+pub fn Scene.place_above(mut self, id: u32, other: u32) {
+    let i = self.find(id)
+    guard i >= 0 and id != other else {
+        return
+    }
+    let e = self.entries.remove(i)
+    self.damage(e.view.bounds())
+    var at = 0
+    if other != 0 {
+        let k = self.find(other)
+        at = if k < 0 { self.entries.len() } else { k + 1 }
+    }
+    self.entries.insert(at, e)
+}
+
 pub fn Scene.resize(mut self, width: u32, height: u32) {
     self.width = f32(width)
     self.height = f32(height)
     self.damage_all()
-}
-
-pub fn Scene.damage_all(mut self) {
-    self.damage(Rect { w: self.width, h: self.height })
 }
 
 /// Nothing changed since the last frame: no need to draw or present.
@@ -142,46 +229,93 @@ pub fn Scene.idle(self) -> bool {
     return self.pending.is_empty()
 }
 
+/// Whether any of `id` shows: on screen and not hidden by an opaque view
+/// above it. Hidden clients can skip frames (no frame callbacks).
+pub fn Scene.visible(self, id: u32) -> bool {
+    let i = self.find(id)
+    guard i >= 0 else {
+        return false
+    }
+    let b = self.entries[i].view.bounds().intersect(self.screen())
+    guard not b.is_empty() else {
+        return false
+    }
+    for k in i + 1..self.entries.len() {
+        if self.entries[k].view.cover().contains(b) {
+            return false
+        }
+    }
+    return true
+}
+
+/// The view that alone fills the screen as it is (opaque, unscaled,
+/// unturned, uncropped, imported, on top): show its buffer directly (a KMS
+/// plane, a parent compositor's surface) instead of rendering.
+pub fn Scene.scanout(self) -> Option[u32] {
+    guard let Some(e) = self.entries.last() else {
+        return None
+    }
+    let v = e.view
+    let screen = self.screen()
+    let plain = v.transform == Transform.Normal and v.src.is_empty() and v.radius <= 0.0
+    let fits = v.rect() == screen and f32(v.tex.width()) == self.width and f32(v.tex.height()) == self.height
+    return if plain and fits and v.tex.imported() and v.cover().contains(screen) { Some(e.id) } else { None }
+}
+
+/// What the last `render` changed on screen against the frame before it:
+/// KMS FB_DAMAGE_CLIPS, or damage for a parent compositor.
+pub fn Scene.changed(self) -> &[Rect] {
+    return self.history[0].rects()
+}
+
 /// Redraw what frame `f` needs into it, recording into `e`; false when
 /// its image is already up to date. Present `e` either way.
 pub fn Scene.render(mut self, mut dev: gpu.Device, mut c: draw2d.Canvas, mut e: gpu.Encoder, f: gpu.Frame) -> Result[bool, str] {
-    let screen = Rect { w: self.width, h: self.height }
-    let now = self.pending.intersect(screen)
-    self.pending = Rect {}
-    var area = now
+    let screen = self.screen()
     let age = int(f.age())
+    var area = mem.replace(mut self.area, Region {})
+    area.clear()
     if age == 0 or age > self.history.len() + 1 {
-        area = screen
+        area.add(screen)
     } else {
+        area.add_region(self.pending)
         for i in 0..age - 1 {
-            area = area.union(self.history[i])
+            area.add_region(self.history[i])
         }
     }
+    var now = if self.history.len() >= history_len { self.history.pop().unwrap() } else { Region {} }
+    now.clear()
+    now.add_region(self.pending)
     self.history.insert(0, now)
-    self.history.truncate(history_len)
-    area = area.intersect(screen)
-    guard not area.is_empty() else {
-        return Ok(false)
+    self.pending.clear()
+    let drew = not area.is_empty()
+    if drew {
+        try self.draw(mut dev, mut c, mut e, f, area)
     }
+    self.area = area
+    return Ok(drew)
+}
 
+fn Scene.draw(self, mut dev: gpu.Device, mut c: draw2d.Canvas, mut e: gpu.Encoder, f: gpu.Frame, area: Region) -> Result[(), str] {
     c.clear()
-    c.rect(screen, self.background)
+    c.rect(self.screen(), self.background)
     for en in self.entries {
         let v = en.view
-        guard v.bounds().overlaps(area) else {
+        guard area.overlaps(v.bounds()) else {
             continue
         }
         if v.shadow > 0.0 {
             c.shadow(v.rect(), vec4(0.0, 0.0, 0.0, 0.45 * v.opacity), v.radius, v.shadow)
         }
-        c.image(v.tex, v.rect(), v.opacity, v.radius)
+        c.texture(v.tex, v.rect(), v.part(), v.transform, vec4(1.0, 1.0, 1.0, v.opacity), v.radius)
+        c.opaque(v.cover())
         e.acquire(v.tex)
     }
-    try c.draw(mut dev, mut e, gpu.Pass { target: f.image(), load: gpu.Load.Keep }, Some(area))
+    try c.draw(mut dev, mut e, gpu.Pass { target: f.image(), load: gpu.Load.Keep }, area.rects())
     for en in self.entries {
-        if en.view.bounds().overlaps(area) {
+        if area.overlaps(en.view.bounds()) {
             e.release(en.view.tex)
         }
     }
-    return Ok(true)
+    return Ok(())
 }

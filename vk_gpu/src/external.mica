@@ -20,6 +20,8 @@ pub struct Dmabuf {
     pub modifier: u64 = 0
     pub offset: u64 = 0
     pub stride: u64
+    /// Alpha reads as 1 (XRGB8888 and the other X formats).
+    pub opaque: bool = false
 }
 
 fn dma_buf() -> vk.ExternalMemoryHandleTypeFlags {
@@ -103,7 +105,7 @@ fn import_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: Dmabuf) 
     let t = try memory_type(mem, req.memory_type_bits & fdp.memory_type_bits)
     let memory = try dedicated(cx, image, req.size, t, d.fd)
     try ctx.ok(cx.fns.bind_image_memory(cx.device, image, memory, 0), "vkBindImageMemory")
-    let view = try res.view(cx, image, d.format)
+    let view = try res.view(cx, image, d.format, d.opaque)
     failed = false
     let a = alloc.Alloc { memory, offset: 0, size: req.size, addr: 0, pool: -1, block: -1 }
     return Ok(res.TexInfo {
@@ -118,6 +120,7 @@ fn import_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: Dmabuf) 
         aspect: res.aspect(d.format),
         ext: true,
         copy: false,
+        opaque: d.opaque,
     })
 }
 
@@ -160,7 +163,7 @@ fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.Text
     unsafe cx.fns.get_image_subresource_layout(cx.device, image, Ptr.of(sub), mut layout)
     var props = vk.ImageDrmFormatModifierPropertiesEXT {}
     try ctx.ok(drm.get_image_drm_format_modifier_properties_ext(cx.device, image, mut props), "vkGetImageDrmFormatModifierPropertiesEXT")
-    let view = try res.view(cx, image, d.format)
+    let view = try res.view(cx, image, d.format, false)
     failed = false
     let a = alloc.Alloc { memory, offset: 0, size: req.size, addr: 0, pool: -1, block: -1 }
     let buf = Dmabuf { fd, width: d.width, height: d.height, format: d.format, modifier: props.drm_format_modifier, offset: layout.offset, stride: layout.row_pitch }

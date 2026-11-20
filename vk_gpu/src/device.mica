@@ -441,6 +441,9 @@ pub fn Device.texture(mut self, d: res.TextureDesc) -> Result[res.Texture, str] 
     guard d.width > 0 and d.height > 0 else {
         return Err("texture size {d.width}x{d.height}")
     }
+    guard not d.opaque or not (d.target or d.storage) else {
+        return Err("an opaque texture is only sampled, not a target or storage")
+    }
     let info = try res.create_texture(self.cx, mut self.mem, d)
     return self.register(info, false)
 }
@@ -449,7 +452,7 @@ pub fn Device.texture(mut self, d: res.TextureDesc) -> Result[res.Texture, str] 
 fn Device.register(mut self, take info: res.TexInfo, ext: bool) -> Result[res.Texture, str] {
     let view = info.view
     let storage = info.storage
-    let t = res.Texture { h: zeroed(), dev: self.id, width: info.width, height: info.height, format: info.format, ext }
+    let t = res.Texture { h: zeroed(), dev: self.id, width: info.width, height: info.height, format: info.format, ext, opaque: info.opaque }
     let h = self.textures.insert(info)
     if h.index >= self.max_textures {
         self.free(Garbage.Tex(h))
@@ -463,7 +466,7 @@ fn Device.register(mut self, take info: res.TexInfo, ext: bool) -> Result[res.Te
 
 /// Track a swapchain image so encoders can render into and present it.
 fn Device.adopt(mut self, image: vk.Image, format: vk.Format, width: u32, height: u32) -> Result[res.Texture, str] {
-    let view = try res.view(self.cx, image, format)
+    let view = try res.view(self.cx, image, format, false)
     let info = res.TexInfo {
         image,
         view,
@@ -694,7 +697,31 @@ pub fn Device.write_texture(mut self, mut e: encoder.Encoder, t: res.Texture, da
         return Err("texture {i.width}x{i.height} of format {i32(i.format)} needs {need} bytes, got {data.len()}")
     }
     let s = try self.stage(data)
-    e.push_cmd(encoder.Cmd.Upload(s, t))
+    e.push_cmd(encoder.Cmd.Upload(s, t, encoder.Area { x: 0, y: 0, w: i.width, h: i.height }))
+    return Ok(())
+}
+
+/// Copy rectangle `x, y, w, h` of an image in `data` (rows of `stride`
+/// bytes from texel 0, 0, as in a wl_shm pool) into the same rectangle of
+/// `t`. Only the bytes the rectangle spans are staged, so a client's damage
+/// costs its own size, not the whole buffer's.
+pub fn Device.write_texture_rect(mut self, mut e: encoder.Encoder, t: res.Texture, x: u32, y: u32, w: u32, h: u32, data: &[u8], stride: u32) -> Result[(), str] {
+    let i = try self.tex(t)
+    guard e.dev == self.id and not i.sc and not i.ext else {
+        return Err("cannot write this texture with this encoder")
+    }
+    let texel = res.texel_size(i.format)
+    guard texel > 0 and w > 0 and h > 0 and u64(x) + u64(w) <= u64(i.width) and u64(y) + u64(h) <= u64(i.height) else {
+        return Err("rect {x},{y} {w}x{h} outside texture {i.width}x{i.height} of format {i32(i.format)}")
+    }
+    let row = u64(stride)
+    let start = u64(y) * row + u64(x) * texel
+    let end = u64(y + h - 1) * row + u64(x + w) * texel
+    guard row % texel == 0 and row >= u64(x + w) * texel and end <= u64(data.len()) else {
+        return Err("stride {stride} and {data.len()} bytes do not hold rect {x},{y} {w}x{h}")
+    }
+    let s = try self.stage(data[int(start)..int(end)])
+    e.push_cmd(encoder.Cmd.Upload(s, t, encoder.Area { x, y, w, h, row: u32(row / texel) }))
     return Ok(())
 }
 
