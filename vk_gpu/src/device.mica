@@ -98,6 +98,7 @@ pub struct Device {
     /// The next submit also signals `exported`, read back as a sync_file.
     export_next: bool = false
     exported: vk.Semaphore = vk.Semaphore {}
+    drm_node: Option[(i64, i64)] = None
     /// Tearing down: free slots are not re-pointed at the placeholders.
     closing: bool = false
     ext: boot.External
@@ -123,6 +124,7 @@ pub fn Device.open(o: Options) -> Result[Device, str] {
         max_groups: base.max_groups,
         wsi: base.wsi.clone(),
         ext: base.ext,
+        drm_node: base.drm_node,
         bl: base.bl,
         max_textures: base.max_textures,
         mem: alloc.new(base.mem_props),
@@ -594,9 +596,32 @@ pub fn Device.import_dmabuf(mut self, d: external.Dmabuf) -> Result[res.Texture,
 /// A linear render target other processes can read, and its dmabuf (the
 /// caller owns the fd).
 pub fn Device.export_dmabuf(mut self, d: res.TextureDesc) -> Result[(res.Texture, external.Dmabuf), str] {
-    let (info, buf) = try external.export_image(self.cx, self.ext, self.mem, d)
+    let linear: [1]u64 = [0]
+    return self.export_dmabuf_with(d, linear)
+}
+
+/// A render target other processes can read, laid out with one of
+/// `modifiers` (the driver picks; a KMS plane's or a parent compositor's
+/// list), and its dmabuf (the caller owns the fd).
+pub fn Device.export_dmabuf_with(mut self, d: res.TextureDesc, modifiers: &[u64]) -> Result[(res.Texture, external.Dmabuf), str] {
+    guard d.width > 0 and d.height > 0 and not modifiers.is_empty() else {
+        return Err("dmabuf {d.width}x{d.height} with {modifiers.len()} modifiers")
+    }
+    let (info, buf) = try external.export_image(self.cx, self.ext, self.mem, d, modifiers)
     let t = try self.register(info, false)
     return Ok((t, buf))
+}
+
+/// The single-plane DRM format modifiers `format` can be imported with
+/// (sampled), or exported with as a render target when `target`.
+pub fn Device.dmabuf_modifiers(self, format: vk.Format, target: bool) -> List[u64] {
+    return external.modifiers(self.cx, self.ext, format, target)
+}
+
+/// The DRM device node (major, minor) this GPU is, render node preferred:
+/// linux-dmabuf's main device.
+pub fn Device.drm_node(self) -> Option[(i64, i64)] {
+    return self.drm_node
 }
 
 /// The next submit waits for sync_file `fd` (taken; -1 means signaled).

@@ -82,6 +82,7 @@ extern table Inst {
     fn enumerate_physical_devices(instance: vk.Instance, mut p_physical_device_count: u32, p_physical_devices: Ptr[vk.PhysicalDevice]) -> vk.VkResult = "vkEnumeratePhysicalDevices"
     fn get_device_proc_addr(device: vk.Device, p_name: str) -> Option[vk.PFN_vkVoidFunction] = "vkGetDeviceProcAddr"
     fn get_physical_device_features2(physical_device: vk.PhysicalDevice, mut p_features: vk.PhysicalDeviceFeatures2) = "vkGetPhysicalDeviceFeatures2"
+    fn get_physical_device_format_properties2(physical_device: vk.PhysicalDevice, format: vk.Format, mut p_format_properties: vk.FormatProperties2) = "vkGetPhysicalDeviceFormatProperties2"
     fn get_physical_device_memory_properties(physical_device: vk.PhysicalDevice, mut p_memory_properties: vk.PhysicalDeviceMemoryProperties) = "vkGetPhysicalDeviceMemoryProperties"
     fn get_physical_device_properties(physical_device: vk.PhysicalDevice, mut p_properties: vk.PhysicalDeviceProperties) = "vkGetPhysicalDeviceProperties"
     fn get_physical_device_properties2(physical_device: vk.PhysicalDevice, mut p_properties: vk.PhysicalDeviceProperties2) = "vkGetPhysicalDeviceProperties2"

@@ -32,6 +32,8 @@ struct Base {
     max_textures: u32
     max_groups: [3]u32
     mem_props: vk.PhysicalDeviceMemoryProperties
+    /// The DRM node (major, minor) of the device, render node preferred.
+    drm_node: Option[(i64, i64)]
 }
 
 /// The physical device to use and the queue family that draws and computes.
@@ -209,10 +211,23 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
     var queue = vk.Queue {}
     fns.get_device_queue(dev, p.family, 0, mut queue)
 
+    var drm = vk.PhysicalDeviceDrmPropertiesEXT {}
     var p12 = vk.PhysicalDeviceVulkan12Properties {}
     var props = vk.PhysicalDeviceProperties2 {}
-    unsafe props.p_next = Ptr.of_mut(mut p12).cast[u8]()
+    let has_drm = has_ext(dexts, vk.ext_physical_device_drm_extension_name)
+    unsafe {
+        if has_drm {
+            p12.p_next = Ptr.of_mut(mut drm).cast[u8]()
+        }
+        props.p_next = Ptr.of_mut(mut p12).cast[u8]()
+    }
     inst.get_physical_device_properties2(p.pdev, mut props)
+    var drm_node: Option[(i64, i64)] = None
+    if has_drm and drm.has_render != 0 {
+        drm_node = Some((drm.render_major, drm.render_minor))
+    } else if has_drm and drm.has_primary != 0 {
+        drm_node = Some((drm.primary_major, drm.primary_minor))
+    }
     var limit = p12.max_descriptor_set_update_after_bind_sampled_images
     limit = min(limit, p12.max_descriptor_set_update_after_bind_storage_images)
     limit = min(limit, p12.max_per_stage_descriptor_update_after_bind_sampled_images)
@@ -254,7 +269,7 @@ fn create(st: vk.StaticFn, o: device.Options) -> Result[Base, str] {
         drm: if on[2] { vk.ExtImageDrmFormatModifierDeviceFn.try_load(fn(n) => inst.get_device_proc_addr(dev, n)) } else { None },
         dmabuf: on[1],
     }
-    return Ok(Base { cx, wsi, ext, bl, max_textures: slots, max_groups: props.properties.limits.max_compute_work_group_count, mem_props })
+    return Ok(Base { cx, wsi, ext, bl, max_textures: slots, max_groups: props.properties.limits.max_compute_work_group_count, mem_props, drm_node })
 }
 
 /// The best Vulkan 1.3 device with every required feature (discrete over

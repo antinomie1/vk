@@ -59,3 +59,35 @@ test "offscreen frames report their age" {
     out.resize(3, 3)
     assert_eq(out.acquire(mut dev).unwrap().unwrap().age(), u32(0))
 }
+
+test "modifiers, exports with a modifier list, and custom frames" {
+    guard let Ok(d) = gpu.Device.open(gpu.Options { headless: true, validation: true }) else {
+        return
+    }
+    var dev = d
+    let sampled = dev.dmabuf_modifiers(gpu.Format.B8G8R8A8_UNORM, false)
+    let rendered = dev.dmabuf_modifiers(gpu.Format.B8G8R8A8_UNORM, true)
+    guard not rendered.is_empty() else {
+        io.eprint("skipped: no dmabuf modifiers")
+        return
+    }
+    assert(sampled.len() >= rendered.len())
+    for m in rendered {
+        assert(sampled.contains(m))
+    }
+    if let Some((major, minor)) = dev.drm_node() {
+        assert(major > 0 and minor >= 0)
+    }
+    // The driver picks one of the offered layouts.
+    let (t, buf) = dev.export_dmabuf_with(gpu.TextureDesc { width: 8, height: 8, format: gpu.Format.B8G8R8A8_UNORM }, rendered).unwrap()
+    assert(rendered.contains(buf.modifier))
+    // A frame of a target outside vk_gpu, drawn and fenced.
+    let f = gpu.Frame.new(t, 0)
+    var e = dev.encoder().unwrap()
+    e.render(gpu.Pass { target: f.image(), clear: [1.0, 0.0, 0.0, 1.0] }, fn(mut r) {})
+    let (ticket, fence) = dev.submit_sync_file(take e).unwrap()
+    assert(fence >= -1)
+    dev.wait(ticket).unwrap()
+    let none: List[u64] = []
+    assert(dev.export_dmabuf_with(gpu.TextureDesc { width: 8, height: 8 }, none).is_err())
+}

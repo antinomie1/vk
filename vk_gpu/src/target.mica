@@ -18,6 +18,13 @@ pub struct Frame {
     age: u32
 }
 
+/// A frame of a target outside vk_gpu (KMS scanout buffers, a parent
+/// compositor's dmabufs): draw into `image`, submit with
+/// `Device.submit_sync_file` and hand the fence to the display.
+pub fn Frame.new(image: res.Texture, age: u32) -> Frame {
+    return Frame { image, wait: vk.Semaphore {}, signal: vk.Semaphore {}, index: 0, age }
+}
+
 pub fn Frame.image(self) -> res.Texture {
     return self.image
 }

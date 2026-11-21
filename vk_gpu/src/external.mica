@@ -124,11 +124,11 @@ fn import_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: Dmabuf) 
     })
 }
 
-/// A linear, exportable render target and its dmabuf (the fd is the caller's).
-fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.TextureDesc) -> Result[(res.TexInfo, Dmabuf), str] {
+/// An exportable render target laid out with one of `modifiers`, and its
+/// dmabuf (the fd is the caller's).
+fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.TextureDesc, modifiers: &[u64]) -> Result[(res.TexInfo, Dmabuf), str] {
     let (fdfns, drm) = try require(e)
-    let linear: u64 = 0
-    unsafe let list = vk.ImageDrmFormatModifierListCreateInfoEXT { drm_format_modifier_count: 1, p_drm_format_modifiers: Ptr.of(linear) }
+    unsafe let list = vk.ImageDrmFormatModifierListCreateInfoEXT { drm_format_modifier_count: u32(modifiers.len()), p_drm_format_modifiers: modifiers.as_ptr() }
     unsafe let external = vk.ExternalMemoryImageCreateInfo { p_next: Ptr.of(list).cast[u8](), handle_types: dma_buf() }
     unsafe let ci = vk.ImageCreateInfo {
         p_next: Ptr.of(external).cast[u8](),
@@ -180,6 +180,39 @@ fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.Text
         target: true,
     }
     return Ok((ti, buf))
+}
+
+/// Single-plane modifiers of `format` usable for sampling, and for
+/// rendering too when `target`.
+fn modifiers(cx: ctx.Ctx, e: boot.External, format: vk.Format, target: bool) -> List[u64] {
+    var out: List[u64] = []
+    guard e.drm.is_some() and e.dmabuf else {
+        return out
+    }
+    var list = vk.DrmFormatModifierPropertiesListEXT {}
+    var props = vk.FormatProperties2 {}
+    unsafe props.p_next = Ptr.of_mut(mut list).cast[u8]()
+    cx.inst.get_physical_device_format_properties2(cx.pdev, format, mut props)
+    let n = int(list.drm_format_modifier_count)
+    var mods: List[vk.DrmFormatModifierPropertiesEXT] = []
+    for _ in 0..n {
+        mods.push(vk.DrmFormatModifierPropertiesEXT {})
+    }
+    unsafe {
+        list.p_drm_format_modifier_properties = mods.as_ptr()
+        props.p_next = Ptr.of_mut(mut list).cast[u8]()
+    }
+    cx.inst.get_physical_device_format_properties2(cx.pdev, format, mut props)
+    var need = vk.FormatFeatureFlags.SAMPLED_IMAGE
+    if target {
+        need |= vk.FormatFeatureFlags.COLOR_ATTACHMENT
+    }
+    for m in mods {
+        if m.drm_format_modifier_plane_count == 1 and m.drm_format_modifier_tiling_features.contains(need) {
+            out.push(m.drm_format_modifier)
+        }
+    }
+    return out
 }
 
 /// A binary semaphore that can import and export sync_files.
