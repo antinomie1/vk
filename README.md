@@ -130,10 +130,13 @@ while running {
 out.destroy(mut dev)
 ```
 
-- Sharing: `export_dmabuf` / `import_dmabuf` (one plane, any DRM
-  modifier, dedicated memory), `submit_sync_file` / `wait_sync_file`;
+- Sharing: `export_dmabuf` / `import_dmabuf` (1..4 planes, non-disjoint or
+  `DISJOINT` BOs detected via `statx`, atomic fd handling), `import_dmabuf_target`
+  + `copy_texture`, `submit_sync_file` / `wait_sync_file`;
   imported textures pass between queue families with `e.acquire(t)` /
-  `e.release(t)`. `opaque` (on `TextureDesc` and `Dmabuf`) makes alpha read
+  `e.release(t)`. Queue global priority (`Options.priority`) negotiates
+  `VK_KHR/EXT_global_priority` with fallback, and `VK_ERROR_DEVICE_LOST`
+  triggers `lost()` for clean teardown/recovery. `opaque` (on `TextureDesc` and `Dmabuf`) makes alpha read
   as 1 through the view's swizzle, for XRGB formats. Frames report their `age()` (buffer age); swapchain
   images keep their contents between presents, so partial redraws work.
 
@@ -162,8 +165,8 @@ checks) and CPU writes to a host-visible buffer the GPU is still reading
 (stale data, not memory corruption: wait for its `Ticket`). Encoders not
 submitted are given back with `dev.cancel(e)`.
 
-Not yet: multi-threaded recording, MRT and mipmaps, multi-plane (YCbCr)
-dmabufs.
+Not yet: multi-threaded recording, MRT and mipmaps, planar YCbCr
+sampler conversion.
 
 ## vk_draw2d
 
@@ -190,8 +193,10 @@ Not yet: backdrop blur.
 ## vk_compose
 
 `Scene`: `add`, `set`, `get`, `commit` (client damage in texture pixels),
-`raise`, `place_above`, `remove`, `resize`, `damage`, `idle`, `visible`,
-`scanout`, `changed`, and `render(dev, canvas, e, frame)`.
+`raise`, `place_above`, `reorder` (O(N log N) LIS damage), `remove`,
+`remove_many`, `resize`, `damage`, `idle`, `visible`, `scanout`,
+`overlay_candidates`, `set_overlays`, `changed`, and
+`render(dev, canvas, e, frame)`.
 
 - A `View` is a texture (an shm upload or an imported dmabuf; a solid color
   is 1x1) with a place and size, a source crop (wp_viewport), a buffer

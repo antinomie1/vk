@@ -17,6 +17,24 @@ import boot
 import record
 import external
 
+pub enum Priority derive(Show) {
+    Default
+    Low
+    Medium
+    High
+    Realtime
+}
+
+pub fn Priority.as_i32(self) -> i32 {
+    return match self {
+        Default => 0
+        Low => 128
+        Medium => 256
+        High => 512
+        Realtime => 1024
+    }
+}
+
 pub struct Options {
     pub app_name: str = "vk_gpu"
     /// Load VK_LAYER_KHRONOS_validation when it is installed.
@@ -25,6 +43,8 @@ pub struct Options {
     pub headless: bool = false
     /// Bindless array size, clamped to what the device allows.
     pub max_textures: u32 = 16384
+    /// Requested queue global priority (falls back toward Default if unsupported/unpermitted).
+    pub priority: Priority = Priority.Default
 }
 
 enum Garbage {
@@ -102,6 +122,8 @@ pub struct Device {
     /// Tearing down: free slots are not re-pointed at the placeholders.
     closing: bool = false
     ext: boot.External
+    priority: Priority = Priority.Default
+    lost: bool = false
 }
 
 let chunk_size: u64 = 8388608
@@ -125,6 +147,7 @@ pub fn Device.open(o: Options) -> Result[Device, str] {
         wsi: base.wsi.clone(),
         ext: base.ext,
         drm_node: base.drm_node,
+        priority: base.priority,
         bl: base.bl,
         max_textures: base.max_textures,
         mem: alloc.new(base.mem_props),
@@ -191,11 +214,41 @@ fn Device.placeholders(mut self) -> Result[(), str] {
 
 // ---- timeline ----
 
+fn Device.check(mut self, r: vk.VkResult, what: str) -> Result[(), str] {
+    if r == vk.VkResult.ERROR_DEVICE_LOST {
+        self.lost = true
+    }
+    return ctx.ok(r, what)
+}
+
+/// Queue global priority granted when this device was created.
+pub fn Device.priority(self) -> Priority {
+    return self.priority
+}
+
+/// Whether Vulkan has reported `VK_ERROR_DEVICE_LOST` or `mark_lost` was called.
+pub fn Device.lost(self) -> bool {
+    return self.lost
+}
+
+/// Mark the device lost (stops future waits/submits and skips `vkDeviceWaitIdle` on drop).
+pub fn Device.mark_lost(mut self) {
+    self.lost = true
+    self.completed = self.submitted
+}
+
 /// True once the GPU has finished the submit `t` names.
 pub fn Device.done(mut self, t: res.Ticket) -> bool {
+    if self.lost {
+        return true
+    }
     if t.value > self.completed {
         var v: u64 = 0
-        discard self.cx.fns.get_semaphore_counter_value(self.cx.device, self.timeline, mut v)
+        let r = self.cx.fns.get_semaphore_counter_value(self.cx.device, self.timeline, mut v)
+        if r == vk.VkResult.ERROR_DEVICE_LOST {
+            self.mark_lost()
+            return true
+        }
         self.completed = v
     }
     return t.value <= self.completed
@@ -203,11 +256,14 @@ pub fn Device.done(mut self, t: res.Ticket) -> bool {
 
 /// Block until `t` is done.
 pub fn Device.wait(mut self, t: res.Ticket) -> Result[(), str] {
+    guard not self.lost else {
+        return Err("device lost")
+    }
     guard not self.done(t) else {
         return Ok(())
     }
     unsafe let info = vk.SemaphoreWaitInfo { semaphore_count: 1, p_semaphores: Ptr.of(self.timeline), p_values: Ptr.of(t.value) }
-    unsafe try ctx.ok(self.cx.fns.wait_semaphores(self.cx.device, Ptr.of(info), ~u64(0)), "vkWaitSemaphores")
+    unsafe try self.check(self.cx.fns.wait_semaphores(self.cx.device, Ptr.of(info), ~u64(0)), "vkWaitSemaphores")
     self.completed = max(self.completed, t.value)
     self.collect()
     return Ok(())
@@ -221,7 +277,10 @@ pub fn Device.idle(mut self) -> Result[(), str] {
 /// Wait for the queue including presentation (which the timeline does not
 /// cover), before a swapchain or its semaphores are destroyed.
 fn Device.drain(mut self) -> Result[(), str] {
-    try ctx.ok(self.cx.fns.device_wait_idle(self.cx.device), "vkDeviceWaitIdle")
+    guard not self.lost else {
+        return Err("device lost")
+    }
+    try self.check(self.cx.fns.device_wait_idle(self.cx.device), "vkDeviceWaitIdle")
     self.completed = self.submitted
     self.collect()
     return Ok(())
@@ -249,10 +308,17 @@ fn Device.free(mut self, g: Garbage) {
                 if not t.sc and not self.closing {
                     bindless.write(cx, h.index, self.blank, self.blank_storage)
                 }
-                cx.fns.destroy_image_view(cx.device, t.view, Ptr.null())
+                if t.view.raw != 0 {
+                    cx.fns.destroy_image_view(cx.device, t.view, Ptr.null())
+                }
                 if t.owned {
                     cx.fns.destroy_image(cx.device, t.image, Ptr.null())
                     self.mem.free(cx, t.mem)
+                    for k in 0..t.extra_mem_count {
+                        if t.extra_mems[k].raw != 0 {
+                            cx.fns.free_memory(cx.device, t.extra_mems[k], Ptr.null())
+                        }
+                    }
                 }
             }
         }
@@ -315,6 +381,9 @@ fn Device.kill(mut self, g: Garbage) {
 /// An empty encoder. Submit it (`submit`, a target's `present`) or
 /// `cancel` it: until then destroyed resources stay alive.
 pub fn Device.encoder(mut self) -> Result[encoder.Encoder, str] {
+    guard not self.lost else {
+        return Err("device lost")
+    }
     self.collect()
     self.open += 1
     return Ok(encoder.new(self.id, self.spare.pop().unwrap_or(encoder.Lists {})))
@@ -347,17 +416,38 @@ pub fn Device.submit(mut self, take e: encoder.Encoder) -> Result[res.Ticket, st
 /// Check and record `e`, then submit it waiting on binary semaphore `wait`
 /// and signaling `signal` (each when non-null) besides the timeline.
 fn Device.submit_sync(mut self, take e: encoder.Encoder, wait: vk.Semaphore, signal: vk.Semaphore) -> Result[res.Ticket, str] {
+    if self.lost {
+        self.export_next = false
+        self.cancel(take e)
+        return Err("device lost")
+    }
     if let Err(msg) = record.check(self, e) {
+        self.export_next = false
         self.cancel(take e)
         return Err(msg)
     }
-    let cb = try self.command_buffer()
+    let cb = match self.command_buffer() {
+        Ok(cb) => cb
+        Err(msg) => {
+            self.export_next = false
+            self.cancel(take e)
+            return Err(msg)
+        }
+    }
     if let Err(msg) = record.translate(mut self, e, cb) {
+        self.export_next = false
         self.free_cmds.push(cb)
         self.cancel(take e)
         return Err(msg)
     }
-    let t = try self.submit_raw(cb, wait, signal)
+    let t = match self.submit_raw(cb, wait, signal) {
+        Ok(t) => t
+        Err(msg) => {
+            self.free_cmds.push(cb)
+            self.cancel(take e)
+            return Err(msg)
+        }
+    }
     self.open -= 1
     self.flush_limbo()
     self.spare.push(e.recycle())
@@ -415,7 +505,17 @@ fn Device.submit_raw(mut self, cb: vk.CommandBuffer, wait: vk.Semaphore, signal:
         p_signal_semaphore_infos: self.signal_infos.as_ptr(),
     }
     unsafe let r = self.cx.fns.queue_submit2(self.cx.queue, 1, Ptr.of(info), vk.Fence {})
-    try ctx.ok(r, "vkQueueSubmit2")
+    if r != vk.VkResult.SUCCESS {
+        self.export_next = false
+        for s in mem.replace(mut self.waits, []) {
+            self.sems.push(s)
+        }
+        if self.exported.raw != 0 {
+            self.sems.push(self.exported)
+            self.exported = vk.Semaphore {}
+        }
+        try self.check(r, "vkQueueSubmit2")
+    }
     self.submitted = value
     self.retire.push_back(Retired { at: value, g: Garbage.Cmd(cb) })
     for s in mem.replace(mut self.waits, []) {
@@ -454,13 +554,14 @@ pub fn Device.texture(mut self, d: res.TextureDesc) -> Result[res.Texture, str] 
 fn Device.register(mut self, take info: res.TexInfo, ext: bool) -> Result[res.Texture, str] {
     let view = info.view
     let storage = info.storage
-    let t = res.Texture { h: zeroed(), dev: self.id, width: info.width, height: info.height, format: info.format, ext, opaque: info.opaque }
+    let sampled_view = if info.sampled and view.raw != 0 { view } else { self.blank }
+    let t = res.Texture { h: zeroed(), dev: self.id, width: info.width, height: info.height, format: info.format, ext, opaque: info.opaque, target: info.target }
     let h = self.textures.insert(info)
     if h.index >= self.max_textures {
         self.free(Garbage.Tex(h))
         return Err("more than {self.max_textures - 2} textures (Options.max_textures)")
     }
-    bindless.write(self.cx, h.index, view, if storage { view } else { self.blank_storage })
+    bindless.write(self.cx, h.index, sampled_view, if storage { view } else { self.blank_storage })
     let tex = res.Texture { h, ..t }
     self.fresh.push(tex)
     return Ok(tex)
@@ -582,15 +683,34 @@ fn Device.tex(self, t: res.Texture) -> Result[res.TexInfo, str] {
 
 // ---- sharing (external.mica) ----
 
-/// Wrap one plane of a client's dmabuf as a texture to sample; on success
-/// the texture owns `d.fd`. Bracket its use in an encoder with
-/// `e.acquire(t)` and `e.release(t)`.
+/// Wrap a 1..4 plane client dmabuf as a texture to sample; on success the
+/// texture owns the plane fds (on error the caller keeps all fds untouched).
+/// Bracket its use in an encoder with `e.acquire(t)` and `e.release(t)`.
 pub fn Device.import_dmabuf(mut self, d: external.Dmabuf) -> Result[res.Texture, str] {
-    guard d.width > 0 and d.height > 0 and d.fd >= 0 else {
-        return Err("dmabuf {d.width}x{d.height} fd {d.fd}")
+    let np = d.plane_count()
+    guard d.width > 0 and d.height > 0 and np >= 1 and np <= 4 else {
+        return Err("dmabuf {d.width}x{d.height} planes {np}")
     }
-    let info = try external.import_image(self.cx, self.ext, self.mem, d)
+    let info = try external.import_image(self.cx, self.ext, self.mem, d, false)
     return self.register(info, true)
+}
+
+/// Wrap a client's dmabuf as a writable capture target (`copy_texture` and,
+/// when `can_target()`, `Encoder.render`). On success the texture owns the
+/// plane fds (on error the caller keeps all fds untouched). Bracket access
+/// with `e.acquire(t)` and `e.release(t)`.
+pub fn Device.import_dmabuf_target(mut self, d: external.Dmabuf) -> Result[res.Texture, str] {
+    let np = d.plane_count()
+    guard d.width > 0 and d.height > 0 and np >= 1 and np <= 4 else {
+        return Err("dmabuf {d.width}x{d.height} planes {np}")
+    }
+    let info = try external.import_image(self.cx, self.ext, self.mem, d, true)
+    return self.register(info, true)
+}
+
+/// Modifiers of `format` usable as a writable capture target.
+pub fn Device.dmabuf_capture_modifiers(self, format: vk.Format) -> List[u64] {
+    return external.copy_modifiers(self.cx, self.ext, format)
 }
 
 /// A linear render target other processes can read, and its dmabuf (the
@@ -655,10 +775,8 @@ fn Device.binary(mut self) -> Result[vk.Semaphore, str] {
 
 // ---- uploads ----
 
-/// Copy `data` into the upload ring; shaders read it at `addr()`. The
-/// bytes stay valid until the GPU finishes the next submit.
-pub fn Device.stage(mut self, data: &[u8]) -> Result[res.Staged, str] {
-    let n = (u64(data.len()) + 255) / 256 * 256
+fn Device.alloc_stage(mut self, byte_len: u64) -> Result[(res.Staged, u64), str] {
+    let n = max((byte_len + 255) / 256 * 256, 256)
     if self.chunk < 0 or self.head + n > self.chunks[self.chunk].size {
         if self.chunk >= 0 {
             self.later(Garbage.Chunk(self.chunk))
@@ -669,10 +787,17 @@ pub fn Device.stage(mut self, data: &[u8]) -> Result[res.Staged, str] {
     let c = self.chunks[self.chunk]
     let off = self.head
     self.head += n
+    return Ok((res.Staged { buffer: c.raw, offset: off, addr: c.addr + off }, c.mapped + off))
+}
+
+/// Copy `data` into the upload ring; shaders read it at `addr()`. The
+/// bytes stay valid until the GPU finishes the next submit.
+pub fn Device.stage(mut self, data: &[u8]) -> Result[res.Staged, str] {
+    let (s, mapped) = try self.alloc_stage(u64(data.len()))
     if data.len() > 0 {
-        unsafe Ptr.copy(Ptr[u8].from_addr(usize(c.mapped + off)), data.as_ptr(), data.len())
+        unsafe Ptr.copy(Ptr[u8].from_addr(usize(mapped)), data.as_ptr(), data.len())
     }
-    return Ok(res.Staged { buffer: c.raw, offset: off, addr: c.addr + off })
+    return Ok(s)
 }
 
 fn Device.new_chunk(mut self, n: u64) -> Result[int, str] {
@@ -740,13 +865,26 @@ pub fn Device.write_texture_rect(mut self, mut e: encoder.Encoder, t: res.Textur
         return Err("rect {x},{y} {w}x{h} outside texture {i.width}x{i.height} of format {i32(i.format)}")
     }
     let row = u64(stride)
+    let row_bytes = u64(w) * texel
     let start = u64(y) * row + u64(x) * texel
     let end = u64(y + h - 1) * row + u64(x + w) * texel
     guard row % texel == 0 and row >= u64(x + w) * texel and end <= u64(data.len()) else {
         return Err("stride {stride} and {data.len()} bytes do not hold rect {x},{y} {w}x{h}")
     }
-    let s = try self.stage(data[int(start)..int(end)])
-    e.push_cmd(encoder.Cmd.Upload(s, t, encoder.Area { x, y, w, h, row: u32(row / texel) }))
+    if row_bytes < row and h > 1 {
+        let (s, mapped) = try self.alloc_stage(row_bytes * u64(h))
+        unsafe {
+            let src = data.as_ptr().offset(int(start))
+            let dst = Ptr[u8].from_addr(usize(mapped))
+            for r in 0..int(h) {
+                Ptr.copy(dst.offset(r * int(row_bytes)), src.offset(r * int(row)), int(row_bytes))
+            }
+        }
+        e.push_cmd(encoder.Cmd.Upload(s, t, encoder.Area { x, y, w, h, row: 0 }))
+    } else {
+        let s = try self.stage(data[int(start)..int(end)])
+        e.push_cmd(encoder.Cmd.Upload(s, t, encoder.Area { x, y, w, h, row: u32(row / texel) }))
+    }
     return Ok(())
 }
 
@@ -792,7 +930,9 @@ fn Device.download(mut self, take e: encoder.Encoder, b: res.Buffer, n: int) -> 
 
 fn Device.drop(mut self) {
     let cx = self.cx
-    discard cx.fns.device_wait_idle(cx.device)
+    if not self.lost {
+        discard cx.fns.device_wait_idle(cx.device)
+    }
     self.closing = true
     self.completed = self.submitted
     for g in mem.replace(mut self.limbo, []) {

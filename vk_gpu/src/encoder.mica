@@ -44,6 +44,8 @@ enum Cmd {
     Copy(res.Staged, res.Buffer, u64, u64)
     /// Upload-ring bytes into a rectangle of a texture.
     Upload(res.Staged, res.Texture, Area)
+    /// Copy/blit rectangle between two textures: src, dst, sx, sy, dx, dy, w, h.
+    CopyImage(res.Texture, res.Texture, i32, i32, i32, i32, u32, u32)
     /// All of a texture into a buffer, tightly packed.
     Download(res.Texture, res.Buffer)
     Acquire(res.Texture)
@@ -116,11 +118,16 @@ pub fn Encoder.acquire(mut self, t: res.Texture) {
     }
 }
 
-/// Hand imported `t` back to its producer after the commands sampling it.
+/// Hand imported `t` back to its producer after the commands accessing it.
 pub fn Encoder.release(mut self, t: res.Texture) {
     if t.ext {
         self.l.cmds.push(Cmd.Release(t))
     }
+}
+
+/// Copy `w`x`h` pixels at (`src_x`, `src_y`) of `src` into (`dst_x`, `dst_y`) of `dst`.
+pub fn Encoder.copy_texture(mut self, src: res.Texture, dst: res.Texture, src_x: i32, src_y: i32, dst_x: i32, dst_y: i32, w: u32, h: u32) {
+    self.l.cmds.push(Cmd.CopyImage(src, dst, src_x, src_y, dst_x, dst_y, w, h))
 }
 
 fn Encoder.push_cmd(mut self, take c: Cmd) {

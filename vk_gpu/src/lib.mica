@@ -16,6 +16,7 @@ pub import external
 
 pub type Device = device.Device
 pub type Options = device.Options
+pub type Priority = device.Priority
 pub type Texture = res.Texture
 pub type TextureDesc = res.TextureDesc
 pub type Buffer = res.Buffer
@@ -36,6 +37,7 @@ pub type Offscreen = target.Offscreen
 pub type Surface = surface.Surface
 pub type Format = vk.Format
 pub type Dmabuf = external.Dmabuf
+pub type Plane = external.Plane
 
 /// Sampler indices in binding 1.
 pub let linear_clamp: u32 = 0

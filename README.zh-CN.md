@@ -118,9 +118,12 @@ while running {
 out.destroy(mut dev)
 ```
 
-- 共享：`export_dmabuf` / `import_dmabuf`（单平面，任意 DRM 修饰符，专用内存），
-  `submit_sync_file` / `wait_sync_file`；导入的纹理用 `e.acquire(t)` /
-  `e.release(t)` 在队列族之间交接所有权。`TextureDesc` 和 `Dmabuf` 的
+- 共享：`export_dmabuf` / `import_dmabuf`（1..4 平面，支持同 BO 与基于
+  `statx` 识别的 `DISJOINT` 多平面、原子 fd 管理）、`import_dmabuf_target`
+  与 `copy_texture`、`submit_sync_file` / `wait_sync_file`；导入纹理用
+  `e.acquire(t)` / `e.release(t)` 在队列族之间交接所有权。队列全局优先级
+  （`Options.priority`）支持 `VK_KHR/EXT_global_priority` 自动降级协商，
+  遇到 `VK_ERROR_DEVICE_LOST` 会标记 `lost()` 以便安全销毁与恢复。`TextureDesc` 和 `Dmabuf` 的
   `opaque` 通过视图的分量重排让 alpha 读作 1，用于 XRGB 格式。帧通过 `age()` 报告缓冲年龄；交换链
   图像在两次呈现之间保留内容，因此可以局部重绘。
 
@@ -143,7 +146,7 @@ out.destroy(mut dev)
 验证层的 GPU 辅助检查），以及 CPU 写入 GPU 仍在读取的主机可见缓冲（得到旧数据，
 不会破坏内存：先等它的 `Ticket`）。未提交的 encoder 用 `dev.cancel(e)` 归还。
 
-尚未实现：多线程录制、多渲染目标与 mipmap、多平面（YCbCr）dmabuf。
+尚未实现：多线程录制、多渲染目标与 mipmap、平面型 YCbCr 采样转换。
 
 ## vk_draw2d
 
@@ -167,8 +170,10 @@ out.destroy(mut dev)
 ## vk_compose
 
 `Scene`：`add`、`set`、`get`、`commit`（客户端损坏区域，单位为纹理像素）、
-`raise`、`place_above`、`remove`、`resize`、`damage`、`idle`、`visible`、
-`scanout`、`changed`，以及 `render(dev, canvas, e, frame)`。
+`raise`、`place_above`、`reorder`（O(N log N) LIS 最小脏区重排）、`remove`、
+`remove_many`、`resize`、`damage`、`idle`、`visible`、`scanout`、
+`overlay_candidates`、`set_overlays`、`changed`，以及
+`render(dev, canvas, e, frame)`。
 
 - `View` 是一张纹理（shm 上传或导入的 dmabuf；纯色用 1x1 纹理），带位置和
   尺寸、源裁剪（wp_viewport）、缓冲变换、不透明度、圆角、投影和不透明区域。

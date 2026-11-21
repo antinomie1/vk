@@ -1,8 +1,10 @@
 // Sharing with other processes (Wayland clients, KMS, video decoders):
-// textures as single-plane dmabufs, GPU work as sync_file fences.
-// Imported textures belong to their producer's queue between submits:
-// `Encoder.acquire` / `release` pass ownership in and out around sampling.
+// textures as 1..4 plane dmabufs (single-BO and disjoint), GPU work as
+// sync_file fences. Imported textures belong to their producer's queue
+// between submits: `Encoder.acquire` / `release` pass ownership in and
+// out around GPU access.
 
+import std.os
 import vk
 import ctx
 import res
@@ -10,18 +12,42 @@ import alloc
 import boot
 import sync
 
-/// One plane of a dmabuf, as linux-dmabuf or KMS describe it.
+when os == "linux" {
+    extern fn statx(dirfd: i32, pathname: Ptr[u8], flags: i32, mask: u32, statxbuf: Ptr[u64]) -> i32
+}
+
+pub struct Plane {
+    pub fd: i32 = -1
+    pub offset: u64 = 0
+    pub stride: u64 = 0
+}
+
+/// A 1..4 plane dmabuf, as linux-dmabuf or KMS describe it.
 pub struct Dmabuf {
-    pub fd: i32
-    pub width: u32
-    pub height: u32
-    pub format: vk.Format
+    pub fd: i32 = -1
+    pub width: u32 = 0
+    pub height: u32 = 0
+    pub format: vk.Format = vk.Format.UNDEFINED
     /// DRM format modifier; 0 is linear.
     pub modifier: u64 = 0
     pub offset: u64 = 0
-    pub stride: u64
+    pub stride: u64 = 0
     /// Alpha reads as 1 (XRGB8888 and the other X formats).
     pub opaque: bool = false
+    /// Plane count (`1..=4`); 1 uses `fd`/`offset`/`stride` when `planes[0].fd < 0`.
+    pub num_planes: int = 1
+    pub planes: [4]Plane = [Plane {}, Plane {}, Plane {}, Plane {}]
+}
+
+pub fn Dmabuf.plane_count(self) -> int {
+    return if self.num_planes > 1 { self.num_planes } else { 1 }
+}
+
+pub fn Dmabuf.plane(self, i: int) -> Plane {
+    if self.num_planes <= 1 and i == 0 and self.planes[0].fd < 0 {
+        return Plane { fd: self.fd, offset: self.offset, stride: self.stride }
+    }
+    return self.planes[i]
 }
 
 fn dma_buf() -> vk.ExternalMemoryHandleTypeFlags {
@@ -41,16 +67,71 @@ fn require(e: boot.External) -> Result[(vk.KhrExternalMemoryFdDeviceFn, vk.ExtIm
     return Ok((fd, drm))
 }
 
-/// A dedicated allocation of type `t` for `image`, importing `fd` when it
-/// is not -1, else exportable as a dmabuf.
-fn dedicated(cx: ctx.Ctx, image: vk.Image, size: u64, t: u32, fd: i32) -> Result[vk.DeviceMemory, str] {
+fn plane_aspect(i: int) -> vk.ImageAspectFlagBits {
+    return match i {
+        0 => vk.ImageAspectFlags.MEMORY_PLANE_0_EXT
+        1 => vk.ImageAspectFlags.MEMORY_PLANE_1_EXT
+        2 => vk.ImageAspectFlags.MEMORY_PLANE_2_EXT
+        _ => vk.ImageAspectFlags.MEMORY_PLANE_3_EXT
+    }
+}
+
+/// Device and inode identity of `fd` via `statx` so dup'd or shared BO
+/// fds across planes can be detected without guessing from fd numbers.
+fn fd_identity(fd: i32) -> Option[(u64, u64)] {
+    when os == "linux" {
+        var buf: [32]u64 = zeroed()
+        unsafe let r = statx(fd, "".as_cstr(), 0x1000, 0x100, Ptr.of_mut(mut buf).cast[u64]())
+        if r == 0 {
+            return Some((buf[17], buf[4]))
+        }
+    }
+    return None
+}
+
+fn same_bo(a: i32, b: i32) -> bool {
+    if a == b {
+        return true
+    }
+    if let Some(ia) = fd_identity(a) {
+        if let Some(ib) = fd_identity(b) {
+            return ia.0 == ib.0 and ia.1 == ib.1
+        }
+    }
+    return false
+}
+
+/// Allocate memory importing `dup_fd` (`fd >= 0`, dedicated when `dedicated_image`),
+/// or exportable memory (`fd < 0`). Does not consume `fd` on error; takes
+/// `dup_fd` on success.
+fn alloc_dmabuf(cx: ctx.Ctx, image: vk.Image, size: u64, t: u32, fd: i32, dedicated_image: bool) -> Result[vk.DeviceMemory, str] {
+    var imp_fd: i32 = -1
+    if fd >= 0 {
+        guard let Ok(d) = os.dup(int(fd)) else {
+            return Err("dup dmabuf fd failed")
+        }
+        imp_fd = i32(d)
+    }
     let only = vk.MemoryDedicatedAllocateInfo { image }
-    unsafe let imp = vk.ImportMemoryFdInfoKHR { p_next: Ptr.of(only).cast[u8](), handle_type: dma_buf(), fd }
-    unsafe let exp = vk.ExportMemoryAllocateInfo { p_next: Ptr.of(only).cast[u8](), handle_types: dma_buf() }
+    unsafe let imp = vk.ImportMemoryFdInfoKHR {
+        p_next: if dedicated_image { Ptr.of(only).cast[u8]() } else { Ptr.null() },
+        handle_type: dma_buf(),
+        fd: imp_fd,
+    }
+    unsafe let exp = vk.ExportMemoryAllocateInfo {
+        p_next: if dedicated_image { Ptr.of(only).cast[u8]() } else { Ptr.null() },
+        handle_types: dma_buf(),
+    }
     unsafe let next = if fd >= 0 { Ptr.of(imp).cast[u8]() } else { Ptr.of(exp).cast[u8]() }
     let info = vk.MemoryAllocateInfo { p_next: next, allocation_size: size, memory_type_index: t }
     var memory = vk.DeviceMemory {}
-    unsafe try ctx.ok(cx.fns.allocate_memory(cx.device, Ptr.of(info), Ptr.null(), mut memory), "vkAllocateMemory (dmabuf)")
+    unsafe let r = cx.fns.allocate_memory(cx.device, Ptr.of(info), Ptr.null(), mut memory)
+    if r != vk.VkResult.SUCCESS {
+        if imp_fd >= 0 {
+            os.close(int(imp_fd))
+        }
+        return Err("vkAllocateMemory (dmabuf): {r}")
+    }
     return Ok(memory)
 }
 
@@ -68,17 +149,116 @@ fn memory_type(mem: alloc.Allocator, bits: u32) -> Result[u32, str] {
     return Err("no memory type can hold this dmabuf")
 }
 
-fn info(d: Dmabuf) -> res.TextureDesc {
-    return res.TextureDesc { width: d.width, height: d.height, format: d.format }
+fn query_modifiers(cx: ctx.Ctx, e: boot.External, format: vk.Format) -> List[vk.DrmFormatModifierPropertiesEXT] {
+    var out: List[vk.DrmFormatModifierPropertiesEXT] = []
+    guard e.drm.is_some() and e.dmabuf else {
+        return out
+    }
+    var list = vk.DrmFormatModifierPropertiesListEXT {}
+    var props = vk.FormatProperties2 {}
+    unsafe props.p_next = Ptr.of_mut(mut list).cast[u8]()
+    cx.inst.get_physical_device_format_properties2(cx.pdev, format, mut props)
+    let n = int(list.drm_format_modifier_count)
+    guard n > 0 else {
+        return out
+    }
+    for _ in 0..n {
+        out.push(vk.DrmFormatModifierPropertiesEXT {})
+    }
+    unsafe {
+        list.p_drm_format_modifier_properties = out.as_ptr()
+        props.p_next = Ptr.of_mut(mut list).cast[u8]()
+    }
+    cx.inst.get_physical_device_format_properties2(cx.pdev, format, mut props)
+    return out
 }
 
-fn import_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: Dmabuf) -> Result[res.TexInfo, str] {
-    let (fdfns, drm) = try require(e)
-    let plane = vk.SubresourceLayout { offset: d.offset, row_pitch: d.stride }
-    unsafe let explicit = vk.ImageDrmFormatModifierExplicitCreateInfoEXT { drm_format_modifier: d.modifier, drm_format_modifier_plane_count: 1, p_plane_layouts: Ptr.of(plane) }
+fn modifier_props(cx: ctx.Ctx, e: boot.External, format: vk.Format, modifier: u64) -> Option[vk.DrmFormatModifierPropertiesEXT] {
+    for m in query_modifiers(cx, e, format) {
+        if m.drm_format_modifier == modifier {
+            return Some(m)
+        }
+    }
+    return None
+}
+
+/// Import a 1..4 plane dmabuf (non-disjoint or disjoint). On success the
+/// texture takes ownership of the caller's unique plane fds; on error all
+/// caller fds remain open and untouched.
+fn import_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: Dmabuf, writable: bool) -> Result[res.TexInfo, str] {
+    let (fdfns, _) = try require(e)
+    let n = d.plane_count()
+    guard n >= 1 and n <= 4 else {
+        return Err("dmabuf plane count {n} is outside 1..4")
+    }
+    var planes: [4]vk.SubresourceLayout = zeroed()
+    var fds: [4]i32 = [-1, -1, -1, -1]
+    for i in 0..n {
+        let p = d.plane(i)
+        guard p.fd >= 0 and (i > 0 or p.stride > 0) else {
+            return Err("dmabuf plane {i} fd {p.fd} stride {p.stride}")
+        }
+        fds[i] = p.fd
+        planes[i] = vk.SubresourceLayout { offset: p.offset, row_pitch: p.stride }
+    }
+    guard let Some(mp) = modifier_props(cx, e, d.format, d.modifier) else {
+        return Err("dmabuf format {i32(d.format)} modifier 0x{d.modifier:x} is not supported")
+    }
+    guard int(mp.drm_format_modifier_plane_count) == n else {
+        return Err("dmabuf modifier 0x{d.modifier:x} expects {mp.drm_format_modifier_plane_count} planes, got {n}")
+    }
+    let feat = mp.drm_format_modifier_tiling_features
+    let has_sampled = feat.contains(vk.FormatFeatureFlags.SAMPLED_IMAGE)
+    let has_color = feat.contains(vk.FormatFeatureFlags.COLOR_ATTACHMENT | vk.FormatFeatureFlags.COLOR_ATTACHMENT_BLEND)
+    let has_dst = feat.contains(vk.FormatFeatureFlags.TRANSFER_DST)
+    let has_src = feat.contains(vk.FormatFeatureFlags.TRANSFER_SRC)
+    var usage = vk.ImageUsageFlags(0)
+    if writable {
+        guard has_dst or has_color else {
+            return Err("dmabuf modifier 0x{d.modifier:x} cannot be written as a capture target")
+        }
+        if has_dst {
+            usage |= vk.ImageUsageFlags.TRANSFER_DST
+        }
+        if has_color {
+            usage |= vk.ImageUsageFlags.COLOR_ATTACHMENT
+        }
+        if has_sampled {
+            usage |= vk.ImageUsageFlags.SAMPLED
+        }
+        if has_src {
+            usage |= vk.ImageUsageFlags.TRANSFER_SRC
+        }
+    } else {
+        guard has_sampled else {
+            return Err("dmabuf modifier 0x{d.modifier:x} cannot be sampled")
+        }
+        usage = vk.ImageUsageFlags.SAMPLED
+        if has_src {
+            usage |= vk.ImageUsageFlags.TRANSFER_SRC
+        }
+    }
+
+    var disjoint = false
+    for i in 1..n {
+        if not same_bo(fds[0], fds[i]) {
+            disjoint = true
+            break
+        }
+    }
+    if disjoint and not feat.contains(vk.FormatFeatureFlags.DISJOINT) {
+        return Err("dmabuf has disjoint plane BOs, but modifier 0x{d.modifier:x} lacks DISJOINT support")
+    }
+
+    unsafe let explicit = vk.ImageDrmFormatModifierExplicitCreateInfoEXT {
+        drm_format_modifier: d.modifier,
+        drm_format_modifier_plane_count: u32(n),
+        p_plane_layouts: Ptr.of(planes).cast[vk.SubresourceLayout](),
+    }
     unsafe let external = vk.ExternalMemoryImageCreateInfo { p_next: Ptr.of(explicit).cast[u8](), handle_types: dma_buf() }
     unsafe let ci = vk.ImageCreateInfo {
         p_next: Ptr.of(external).cast[u8](),
+        flags: if disjoint { vk.ImageCreateFlags.DISJOINT } else { vk.ImageCreateFlags(0) },
         image_type: vk.ImageType.TYPE_2D,
         format: d.format,
         extent: vk.Extent3D { width: d.width, height: d.height, depth: 1 },
@@ -86,46 +266,134 @@ fn import_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: Dmabuf) 
         array_layers: 1,
         samples: vk.SampleCountFlags.TYPE_1,
         tiling: vk.ImageTiling.DRM_FORMAT_MODIFIER_EXT,
-        usage: vk.ImageUsageFlags.SAMPLED | vk.ImageUsageFlags.TRANSFER_SRC,
+        usage,
         sharing_mode: vk.SharingMode.EXCLUSIVE,
         initial_layout: vk.ImageLayout.UNDEFINED,
     }
     var image = vk.Image {}
     unsafe try ctx.ok(cx.fns.create_image(cx.device, Ptr.of(ci), Ptr.null(), mut image), "vkCreateImage (dmabuf)")
+    var unique_mems: List[vk.DeviceMemory] = []
+    var view = vk.ImageView {}
     var failed = true
     defer {
         if failed {
+            if view.raw != 0 {
+                cx.fns.destroy_image_view(cx.device, view, Ptr.null())
+            }
             cx.fns.destroy_image(cx.device, image, Ptr.null())
+            for um in unique_mems {
+                cx.fns.free_memory(cx.device, um, Ptr.null())
+            }
         }
     }
-    var fdp = vk.MemoryFdPropertiesKHR {}
-    try ctx.ok(fdfns.get_memory_fd_properties_khr(cx.device, dma_buf(), d.fd, mut fdp), "vkGetMemoryFdPropertiesKHR")
-    var req = vk.MemoryRequirements {}
-    cx.fns.get_image_memory_requirements(cx.device, image, mut req)
-    let t = try memory_type(mem, req.memory_type_bits & fdp.memory_type_bits)
-    let memory = try dedicated(cx, image, req.size, t, d.fd)
-    try ctx.ok(cx.fns.bind_image_memory(cx.device, image, memory, 0), "vkBindImageMemory")
-    let view = try res.view(cx, image, d.format, d.opaque)
+
+    var primary_mem = vk.DeviceMemory {}
+    var primary_size: u64 = 0
+    var extra_mems: [3]vk.DeviceMemory = [vk.DeviceMemory {}, vk.DeviceMemory {}, vk.DeviceMemory {}]
+    var extra_count = 0
+
+    if not disjoint {
+        var fdp = vk.MemoryFdPropertiesKHR {}
+        try ctx.ok(fdfns.get_memory_fd_properties_khr(cx.device, dma_buf(), fds[0], mut fdp), "vkGetMemoryFdPropertiesKHR")
+        var req = vk.MemoryRequirements {}
+        cx.fns.get_image_memory_requirements(cx.device, image, mut req)
+        let t = try memory_type(mem, req.memory_type_bits & fdp.memory_type_bits)
+        primary_mem = try alloc_dmabuf(cx, image, req.size, t, fds[0], true)
+        primary_size = req.size
+        unique_mems.push(primary_mem)
+        try ctx.ok(cx.fns.bind_image_memory(cx.device, image, primary_mem, 0), "vkBindImageMemory")
+    } else {
+        var plane_mems: [4]vk.DeviceMemory = [vk.DeviceMemory {}, vk.DeviceMemory {}, vk.DeviceMemory {}, vk.DeviceMemory {}]
+        for i in 0..n {
+            var reused = -1
+            for j in 0..i {
+                if same_bo(fds[j], fds[i]) {
+                    reused = j
+                    break
+                }
+            }
+            if reused >= 0 {
+                plane_mems[i] = plane_mems[reused]
+                continue
+            }
+            let pinfo = vk.ImagePlaneMemoryRequirementsInfo { plane_aspect: plane_aspect(i) }
+            unsafe let mr_info = vk.ImageMemoryRequirementsInfo2 { p_next: Ptr.of(pinfo).cast[u8](), image }
+            var req2 = vk.MemoryRequirements2 {}
+            unsafe cx.fns.get_image_memory_requirements2(cx.device, Ptr.of(mr_info), mut req2)
+            let req = req2.memory_requirements
+            var fdp = vk.MemoryFdPropertiesKHR {}
+            try ctx.ok(fdfns.get_memory_fd_properties_khr(cx.device, dma_buf(), fds[i], mut fdp), "vkGetMemoryFdPropertiesKHR")
+            let t = try memory_type(mem, req.memory_type_bits & fdp.memory_type_bits)
+            let pm = try alloc_dmabuf(cx, image, req.size, t, fds[i], false)
+            unique_mems.push(pm)
+            plane_mems[i] = pm
+            if unique_mems.len() == 1 {
+                primary_mem = pm
+                primary_size = req.size
+            } else {
+                extra_mems[extra_count] = pm
+                extra_count += 1
+            }
+        }
+        var plane_infos: [4]vk.BindImagePlaneMemoryInfo = zeroed()
+        var bind_infos: [4]vk.BindImageMemoryInfo = zeroed()
+        for i in 0..n {
+            plane_infos[i] = vk.BindImagePlaneMemoryInfo { plane_aspect: plane_aspect(i) }
+        }
+        unsafe {
+            let pbase = Ptr.of(plane_infos).cast[vk.BindImagePlaneMemoryInfo]()
+            let bbase = Ptr.of_mut(mut bind_infos).cast[vk.BindImageMemoryInfo]()
+            for i in 0..n {
+                bbase.offset(i).write(vk.BindImageMemoryInfo {
+                    p_next: pbase.offset(i).cast[u8](),
+                    image,
+                    memory: plane_mems[i],
+                    memory_offset: 0,
+                })
+            }
+            try ctx.ok(cx.fns.bind_image_memory2(cx.device, u32(n), bbase), "vkBindImageMemory2")
+        }
+    }
+
+    if (not writable and has_sampled) or has_color {
+        view = try res.view(cx, image, d.format, d.opaque and not writable)
+    }
     failed = false
-    let a = alloc.Alloc { memory, offset: 0, size: req.size, addr: 0, pool: -1, block: -1 }
+    for i in 0..n {
+        var duped = false
+        for j in 0..i {
+            if fds[j] == fds[i] {
+                duped = true
+                break
+            }
+        }
+        if not duped {
+            os.close(int(fds[i]))
+        }
+    }
+    let a = alloc.Alloc { memory: primary_mem, offset: 0, size: primary_size, addr: 0, pool: -1, block: -1 }
     return Ok(res.TexInfo {
         image,
         view,
         mem: a,
-        state: sync.Use.Sampled,
+        extra_mems,
+        extra_mem_count: extra_count,
+        state: if writable { sync.Use.Undefined } else { sync.Use.Sampled },
         owned: true,
         format: d.format,
         width: d.width,
         height: d.height,
         aspect: res.aspect(d.format),
         ext: true,
-        copy: false,
+        sampled: has_sampled and not writable,
+        target: writable and has_color,
+        copy: writable and has_dst,
         opaque: d.opaque,
     })
 }
 
 /// An exportable render target laid out with one of `modifiers`, and its
-/// dmabuf (the fd is the caller's).
+/// dmabuf (the fds are the caller's).
 fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.TextureDesc, modifiers: &[u64]) -> Result[(res.TexInfo, Dmabuf), str] {
     let (fdfns, drm) = try require(e)
     unsafe let list = vk.ImageDrmFormatModifierListCreateInfoEXT { drm_format_modifier_count: u32(modifiers.len()), p_drm_format_modifiers: modifiers.as_ptr() }
@@ -145,28 +413,68 @@ fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.Text
     }
     var image = vk.Image {}
     unsafe try ctx.ok(cx.fns.create_image(cx.device, Ptr.of(ci), Ptr.null(), mut image), "vkCreateImage (exportable)")
+    var memory = vk.DeviceMemory {}
+    var opened_fds: List[i32] = []
     var failed = true
     defer {
         if failed {
+            for fd in opened_fds {
+                if fd >= 0 {
+                    os.close(int(fd))
+                }
+            }
             cx.fns.destroy_image(cx.device, image, Ptr.null())
+            if memory.raw != 0 {
+                cx.fns.free_memory(cx.device, memory, Ptr.null())
+            }
         }
     }
     var req = vk.MemoryRequirements {}
     cx.fns.get_image_memory_requirements(cx.device, image, mut req)
-    let memory = try dedicated(cx, image, req.size, try memory_type(mem, req.memory_type_bits), -1)
+    memory = try alloc_dmabuf(cx, image, req.size, try memory_type(mem, req.memory_type_bits), -1, true)
     try ctx.ok(cx.fns.bind_image_memory(cx.device, image, memory, 0), "vkBindImageMemory")
     let gi = vk.MemoryGetFdInfoKHR { memory, handle_type: dma_buf() }
     var fd: i32 = -1
     unsafe try ctx.ok(fdfns.get_memory_fd_khr(cx.device, Ptr.of(gi), mut fd), "vkGetMemoryFdKHR")
-    let sub = vk.ImageSubresource { aspect_mask: vk.ImageAspectFlags.MEMORY_PLANE_0_EXT }
-    var layout = vk.SubresourceLayout {}
-    unsafe cx.fns.get_image_subresource_layout(cx.device, image, Ptr.of(sub), mut layout)
+    opened_fds.push(fd)
     var props = vk.ImageDrmFormatModifierPropertiesEXT {}
     try ctx.ok(drm.get_image_drm_format_modifier_properties_ext(cx.device, image, mut props), "vkGetImageDrmFormatModifierPropertiesEXT")
+    var plane_count = 1
+    if let Some(mp) = modifier_props(cx, e, d.format, props.drm_format_modifier) {
+        let mc = int(mp.drm_format_modifier_plane_count)
+        if mc >= 1 and mc <= 4 {
+            plane_count = mc
+        }
+    }
+    var planes: [4]Plane = [Plane {}, Plane {}, Plane {}, Plane {}]
+    for i in 0..plane_count {
+        let sub = vk.ImageSubresource { aspect_mask: plane_aspect(i) }
+        var layout = vk.SubresourceLayout {}
+        unsafe cx.fns.get_image_subresource_layout(cx.device, image, Ptr.of(sub), mut layout)
+        var pfd = fd
+        if i > 0 {
+            guard let Ok(d2) = os.dup(int(fd)) else {
+                return Err("dup exported plane fd failed")
+            }
+            pfd = i32(d2)
+            opened_fds.push(pfd)
+        }
+        planes[i] = Plane { fd: pfd, offset: layout.offset, stride: layout.row_pitch }
+    }
     let view = try res.view(cx, image, d.format, false)
     failed = false
     let a = alloc.Alloc { memory, offset: 0, size: req.size, addr: 0, pool: -1, block: -1 }
-    let buf = Dmabuf { fd, width: d.width, height: d.height, format: d.format, modifier: props.drm_format_modifier, offset: layout.offset, stride: layout.row_pitch }
+    let buf = Dmabuf {
+        fd: planes[0].fd,
+        width: d.width,
+        height: d.height,
+        format: d.format,
+        modifier: props.drm_format_modifier,
+        offset: planes[0].offset,
+        stride: planes[0].stride,
+        num_planes: plane_count,
+        planes,
+    }
     let ti = res.TexInfo {
         image,
         view,
@@ -182,33 +490,29 @@ fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.Text
     return Ok((ti, buf))
 }
 
-/// Single-plane modifiers of `format` usable for sampling, and for
-/// rendering too when `target`.
+/// 1..4 plane modifiers of `format` usable for sampling, and for rendering
+/// too when `target`.
 fn modifiers(cx: ctx.Ctx, e: boot.External, format: vk.Format, target: bool) -> List[u64] {
     var out: List[u64] = []
-    guard e.drm.is_some() and e.dmabuf else {
-        return out
-    }
-    var list = vk.DrmFormatModifierPropertiesListEXT {}
-    var props = vk.FormatProperties2 {}
-    unsafe props.p_next = Ptr.of_mut(mut list).cast[u8]()
-    cx.inst.get_physical_device_format_properties2(cx.pdev, format, mut props)
-    let n = int(list.drm_format_modifier_count)
-    var mods: List[vk.DrmFormatModifierPropertiesEXT] = []
-    for _ in 0..n {
-        mods.push(vk.DrmFormatModifierPropertiesEXT {})
-    }
-    unsafe {
-        list.p_drm_format_modifier_properties = mods.as_ptr()
-        props.p_next = Ptr.of_mut(mut list).cast[u8]()
-    }
-    cx.inst.get_physical_device_format_properties2(cx.pdev, format, mut props)
     var need = vk.FormatFeatureFlags.SAMPLED_IMAGE
     if target {
-        need |= vk.FormatFeatureFlags.COLOR_ATTACHMENT
+        need |= vk.FormatFeatureFlags.COLOR_ATTACHMENT | vk.FormatFeatureFlags.COLOR_ATTACHMENT_BLEND
     }
-    for m in mods {
-        if m.drm_format_modifier_plane_count == 1 and m.drm_format_modifier_tiling_features.contains(need) {
+    for m in query_modifiers(cx, e, format) {
+        if m.drm_format_modifier_plane_count >= 1 and m.drm_format_modifier_plane_count <= 4 and m.drm_format_modifier_tiling_features.contains(need) {
+            out.push(m.drm_format_modifier)
+        }
+    }
+    return out
+}
+
+/// Modifiers of `format` writable as a capture destination (`TRANSFER_DST` or `COLOR_ATTACHMENT`).
+fn copy_modifiers(cx: ctx.Ctx, e: boot.External, format: vk.Format) -> List[u64] {
+    var out: List[u64] = []
+    let color = vk.FormatFeatureFlags.COLOR_ATTACHMENT | vk.FormatFeatureFlags.COLOR_ATTACHMENT_BLEND
+    for m in query_modifiers(cx, e, format) {
+        let f = m.drm_format_modifier_tiling_features
+        if m.drm_format_modifier_plane_count >= 1 and m.drm_format_modifier_plane_count <= 4 and (f.contains(vk.FormatFeatureFlags.TRANSFER_DST) or f.contains(color)) {
             out.push(m.drm_format_modifier)
         }
     }

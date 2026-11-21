@@ -20,6 +20,8 @@ pub struct Texture {
     /// Imported: owned by its producer between `acquire` and `release`.
     ext: bool = false
     opaque: bool = false
+    /// Supports rendering as a color/depth attachment (`COLOR_ATTACHMENT`).
+    target: bool = false
 }
 
 /// Bindless slot; a destroyed texture's slot samples transparent black.
@@ -47,6 +49,11 @@ pub fn Texture.opaque(self) -> bool {
 /// Imported from another process (`Device.import_dmabuf`).
 pub fn Texture.imported(self) -> bool {
     return self.ext
+}
+
+/// Whether the texture can be rendered into as a pass target.
+pub fn Texture.can_target(self) -> bool {
+    return self.target
 }
 
 /// A buffer; shaders reach it through `addr()` (buffer device address).
@@ -106,6 +113,9 @@ struct TexInfo {
     image: vk.Image
     view: vk.ImageView
     mem: alloc.Alloc
+    /// Extra device memories for disjoint multi-plane dmabuf imports.
+    extra_mems: [3]vk.DeviceMemory = [vk.DeviceMemory {}, vk.DeviceMemory {}, vk.DeviceMemory {}]
+    extra_mem_count: int = 0
     state: sync.Use
     /// false for swapchain images, which the device does not own.
     owned: bool
@@ -117,6 +127,7 @@ struct TexInfo {
     sc: bool = false
     ext: bool = false
     /// Usages it was made with.
+    sampled: bool = true
     target: bool = false
     storage: bool = false
     copy: bool = true

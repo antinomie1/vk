@@ -13,6 +13,7 @@ enum Use derive(Show) {
     Storage
     CopySrc
     CopyDst
+    General
     Present
 }
 
@@ -32,6 +33,7 @@ fn Use.access(self) -> Access {
         Storage => Access { layout: vk.ImageLayout.GENERAL, stage: vk.PipelineStageFlags2.FRAGMENT_SHADER | vk.PipelineStageFlags2.COMPUTE_SHADER, access: vk.AccessFlags2.SHADER_STORAGE_READ | vk.AccessFlags2.SHADER_STORAGE_WRITE, write: true }
         CopySrc => Access { layout: vk.ImageLayout.TRANSFER_SRC_OPTIMAL, stage: vk.PipelineStageFlags2.ALL_TRANSFER, access: vk.AccessFlags2.TRANSFER_READ, write: false }
         CopyDst => Access { layout: vk.ImageLayout.TRANSFER_DST_OPTIMAL, stage: vk.PipelineStageFlags2.ALL_TRANSFER, access: vk.AccessFlags2.TRANSFER_WRITE, write: true }
+        General => Access { layout: vk.ImageLayout.GENERAL, stage: vk.PipelineStageFlags2.ALL_COMMANDS, access: vk.AccessFlags2.MEMORY_READ | vk.AccessFlags2.MEMORY_WRITE, write: false }
         Present => Access { layout: vk.ImageLayout.PRESENT_SRC_KHR, stage: vk.PipelineStageFlags2.ALL_COMMANDS, access: vk.AccessFlags2.NONE, write: false }
     }
 }
