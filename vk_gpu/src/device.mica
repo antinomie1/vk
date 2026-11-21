@@ -600,6 +600,11 @@ pub fn Device.destroy_texture(mut self, t: res.Texture) {
     self.later(Garbage.Tex(t.h))
 }
 
+/// Bytes held in shared memory blocks (not dedicated allocations).
+pub fn Device.memory_held(self) -> u64 {
+    return self.mem.held()
+}
+
 /// A buffer of `size` bytes in `mem`; every usage is enabled.
 pub fn Device.buffer(mut self, size: u64, mem: alloc.Mem) -> Result[res.Buffer, str] {
     guard size > 0 else {

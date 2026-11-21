@@ -195,3 +195,25 @@ test "opaque textures are sampled only" {
     assert(t.opaque())
     assert(dev.texture(gpu.TextureDesc { width: 2, height: 2, opaque: true, target: true }).is_err())
 }
+
+test "memory blocks grow from a few MiB and shrink when emptied" {
+    guard let Some(d) = device() else {
+        return
+    }
+    var dev = d
+    let small = dev.buffer(4096, gpu.Mem.Gpu).unwrap()
+    let base = dev.memory_held()
+    assert(base <= 16777216)
+    var bufs: List[gpu.Buffer] = []
+    for i in 0..24 {
+        bufs.push(dev.buffer(1048576, gpu.Mem.Gpu).unwrap())
+    }
+    let grown = dev.memory_held()
+    assert(grown > base)
+    for b in bufs {
+        dev.destroy_buffer(b)
+    }
+    dev.wait(dev.submit(dev.encoder().unwrap()).unwrap()).unwrap()
+    assert(dev.memory_held() < grown)
+    dev.destroy_buffer(small)
+}

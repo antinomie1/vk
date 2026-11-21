@@ -101,8 +101,9 @@ descriptor sets, fences, layouts or barriers in user code.
 - Swapchain rebuilds on `resize` (Wayland), out-of-date, or after a
   suboptimal frame was presented; two frames in flight; FIFO or
   mailbox/immediate.
-- Memory: 64 MiB blocks per type, first-fit with merging, dedicated over
-  32 MiB; host-visible memory stays mapped; device-local uploads when the
+- Memory: blocks per type that start at 4 MiB and double up to 64 MiB,
+  first-fit with merging, dedicated over 32 MiB, emptied blocks freed;
+  host-visible memory stays mapped; device-local uploads when the
   whole VRAM is mappable. An 8 MiB upload ring (`stage`, `write`,
   `write_texture`, `write_texture_rect`) recycled by tickets.
   `write_texture_rect` copies a rectangle out of a strided image (a wl_shm

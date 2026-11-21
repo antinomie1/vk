@@ -90,8 +90,8 @@ framebuffer、描述符集、fence、布局和屏障。
   接好的。
 - 交换链在 `resize`（Wayland）、out-of-date、或 suboptimal 帧呈现后重建；两帧
   并行；FIFO 或 mailbox/immediate。
-- 内存：每种类型 64 MiB 块，首次适配并合并空闲段，超过 32 MiB 单独分配；
-  主机可见内存常驻映射；整块显存可映射时上传直接写显存。8 MiB 上传环
+- 内存：每种类型的块从 4 MiB 起倍增到 64 MiB，首次适配并合并空闲段，超过 32 MiB 单独分配，
+  空出的块释放；主机可见内存常驻映射；整块显存可映射时上传直接写显存。8 MiB 上传环
   （`stage`、`write`、`write_texture`、`write_texture_rect`）按 Ticket 回收。
   `write_texture_rect` 从带行跨度的图像（wl_shm 池）中拷贝一个矩形，只暂存它
   覆盖的字节。Encoder 列表和命令缓冲

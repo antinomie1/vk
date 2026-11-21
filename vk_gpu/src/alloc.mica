@@ -1,6 +1,9 @@
-// Device memory: 64 MiB blocks per memory type, carved first-fit from
-// sorted free ranges that merge on release; a request over half a block
-// gets its own allocation. Host-visible blocks stay mapped.
+// Device memory: blocks per memory type, carved first-fit from sorted free
+// ranges that merge on release. A pool's first block is 4 MiB and each new
+// one doubles, up to 64 MiB (an eighth of a small heap), so a small desktop
+// holds a few MiB, not 64. A request over half the largest block gets its
+// own allocation. A block that empties is freed unless it is the pool's
+// last. Host-visible blocks stay mapped.
 
 import vk
 import ctx
@@ -21,6 +24,8 @@ struct Range {
 
 struct Block {
     memory: vk.DeviceMemory
+    /// 0: freed, the slot is reused by the next block.
+    size: u64
     /// Mapped address of offset 0; 0 when not host-visible.
     addr: u64
     free: List[Range]
@@ -32,6 +37,8 @@ struct Pool {
     type_index: u32
     linear: bool
     blocks: List[Block]
+    /// The size of the next block.
+    next: u64
 }
 
 struct Alloc {
@@ -50,8 +57,10 @@ struct Allocator {
     pools: List[Pool] = []
     /// A device-local, host-visible heap larger than the 256 MiB BAR.
     rebar: bool = false
-    block_size: u64 = 67108864
 }
+
+let first_block: u64 = 4194304
+let max_block: u64 = 67108864
 
 fn new(props: vk.PhysicalDeviceMemoryProperties) -> Allocator {
     var rebar = false
@@ -100,7 +109,9 @@ fn Allocator.alloc(mut self, cx: ctx.Ctx, req: vk.MemoryRequirements, mem: Mem, 
         return Err("no memory type for {mem}")
     }
     let host = self.props.memory_types[t].property_flags.contains(vk.MemoryPropertyFlags.HOST_VISIBLE)
-    if req.size > self.block_size / 2 {
+    let heap = self.props.memory_heaps[self.props.memory_types[t].heap_index].size
+    let largest = max(first_block, min(max_block, heap / 8))
+    if req.size > largest / 2 {
         let (memory, addr) = try raw(cx, u32(t), req.size, host)
         return Ok(Alloc { memory, offset: 0, size: req.size, addr, pool: -1, block: -1 })
     }
@@ -112,16 +123,30 @@ fn Allocator.alloc(mut self, cx: ctx.Ctx, req: vk.MemoryRequirements, mem: Mem, 
     }
     if p < 0 {
         p = self.pools.len()
-        self.pools.push(Pool { type_index: u32(t), linear, blocks: [] })
+        self.pools.push(Pool { type_index: u32(t), linear, blocks: [], next: first_block })
     }
+    var slot = -1
     for b in 0..self.pools[p].blocks.len() {
-        if let Some(off) = self.pools[p].blocks[b].take(req.size, req.alignment) {
+        if self.pools[p].blocks[b].size == 0 {
+            slot = b
+        } else if let Some(off) = self.pools[p].blocks[b].take(req.size, req.alignment) {
             return Ok(self.at(p, b, off, req.size))
         }
     }
-    let (memory, addr) = try raw(cx, u32(t), self.block_size, host)
-    self.pools[p].blocks.push(Block { memory, addr, free: [Range { off: 0, size: self.block_size }] })
-    let b = self.pools[p].blocks.len() - 1
+    var size = min(self.pools[p].next, largest)
+    while size < req.size * 2 {
+        size *= 2
+    }
+    self.pools[p].next = min(size * 2, largest)
+    let (memory, addr) = try raw(cx, u32(t), size, host)
+    let blk = Block { memory, size, addr, free: [Range { off: 0, size }] }
+    if slot < 0 {
+        slot = self.pools[p].blocks.len()
+        self.pools[p].blocks.push(blk)
+    } else {
+        self.pools[p].blocks[slot] = blk
+    }
+    let b = slot
     let off = self.pools[p].blocks[b].take(req.size, req.alignment).unwrap()
     return Ok(self.at(p, b, off, req.size))
 }
@@ -138,13 +163,39 @@ fn Allocator.free(mut self, cx: ctx.Ctx, a: Alloc) {
         return
     }
     self.pools[a.pool].blocks[a.block].give(a.offset, a.size)
+    guard self.pools[a.pool].blocks[a.block].empty() else {
+        return
+    }
+    var live = 0
+    for other in self.pools[a.pool].blocks {
+        if other.size > 0 {
+            live += 1
+        }
+    }
+    if live > 1 {
+        cx.fns.free_memory(cx.device, self.pools[a.pool].blocks[a.block].memory, Ptr.null())
+        self.pools[a.pool].blocks[a.block] = Block { memory: vk.DeviceMemory {}, size: 0, addr: 0, free: [] }
+    }
+}
+
+/// Bytes held in blocks, for tests and budgets.
+fn Allocator.held(self) -> u64 {
+    var n: u64 = 0
+    for pool in self.pools {
+        for blk in pool.blocks {
+            n += blk.size
+        }
+    }
+    return n
 }
 
 /// Free every block (the device is idle).
 fn Allocator.destroy(mut self, cx: ctx.Ctx) {
     for pool in self.pools {
         for blk in pool.blocks {
-            cx.fns.free_memory(cx.device, blk.memory, Ptr.null())
+            if blk.size > 0 {
+                cx.fns.free_memory(cx.device, blk.memory, Ptr.null())
+            }
         }
     }
     self.pools.clear()
@@ -191,6 +242,10 @@ fn Block.take(mut self, size: u64, align: u64) -> Option[u64] {
         }
     }
     return None
+}
+
+fn Block.empty(self) -> bool {
+    return self.free.len() == 1 and self.free[0].size == self.size
 }
 
 /// Return `[off, off + size)`, merging it with its neighbors.
