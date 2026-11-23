@@ -38,6 +38,8 @@ pub struct View {
     /// (`TextureDesc.opaque`, `Dmabuf.opaque`) is opaque everywhere.
     /// Nothing it hides is drawn.
     pub opaque: Rect = Rect {}
+    /// Source color space (`draw2d.color_sdr`, `color_scrgb`, `color_bt2020_pq`, `color_bt2020_hlg`).
+    pub color_space: u32 = 0
 }
 
 /// The texture's size turned upright.
@@ -94,6 +96,9 @@ pub struct Scene {
     width: f32
     height: f32
     background: vec4
+    dst_color: u32 = 0
+    sdr_nits: f32 = 203.0
+    max_nits: f32 = 1000.0
     entries: List[Entry] = []
     index: map.Map[u32, int]
     next: u32 = 1
@@ -383,6 +388,19 @@ pub fn Scene.resize(mut self, width: u32, height: u32) {
     self.damage_all()
 }
 
+/// Configure output color space (`draw2d.dst_sdr`, `dst_hdr_pq`, `dst_hdr_scrgb`),
+/// SDR reference white (`sdr_nits`) and display peak luminance (`max_nits`).
+pub fn Scene.set_output_color(mut self, dst_color: u32, sdr_nits: f32, max_nits: f32) {
+    let sn = max(sdr_nits, 10.0)
+    let mn = max(max_nits, sn)
+    if self.dst_color != dst_color or self.sdr_nits != sn or self.max_nits != mn {
+        self.dst_color = dst_color
+        self.sdr_nits = sn
+        self.max_nits = mn
+        self.damage_all()
+    }
+}
+
 /// Nothing changed since the last frame: no need to draw or present.
 pub fn Scene.idle(self) -> bool {
     return self.pending.is_empty()
@@ -417,8 +435,9 @@ pub fn Scene.scanout(self) -> Option[u32] {
     let v = e.view
     let screen = self.screen()
     let plain = v.transform == Transform.Normal and v.src.is_empty() and v.radius <= 0.0
+    let color_match = (self.dst_color == draw2d.dst_sdr and v.color_space == draw2d.color_sdr) or (self.dst_color == draw2d.dst_hdr_pq and v.color_space == draw2d.color_bt2020_pq) or (self.dst_color == draw2d.dst_hdr_scrgb and v.color_space == draw2d.color_scrgb)
     let fits = v.rect() == screen and f32(v.tex.width()) == self.width and f32(v.tex.height()) == self.height
-    return if plain and fits and v.tex.imported() and v.cover().contains(screen) { Some(e.id) } else { None }
+    return if plain and color_match and fits and v.tex.imported() and v.cover().contains(screen) { Some(e.id) } else { None }
 }
 
 /// Up to `max_count` views eligible for hardware overlay planes above the
@@ -530,6 +549,7 @@ pub fn Scene.render(mut self, mut dev: gpu.Device, mut c: draw2d.Canvas, mut e: 
 
 fn Scene.draw(self, mut dev: gpu.Device, mut c: draw2d.Canvas, mut e: gpu.Encoder, f: gpu.Frame, area: Region) -> Result[(), str] {
     c.clear()
+    c.set_output_color(self.dst_color, self.sdr_nits, self.max_nits)
     c.rect(self.screen(), self.background)
     for en in self.entries {
         if en.overlay {
@@ -542,7 +562,7 @@ fn Scene.draw(self, mut dev: gpu.Device, mut c: draw2d.Canvas, mut e: gpu.Encode
         if v.shadow > 0.0 {
             c.shadow(v.rect(), vec4(0.0, 0.0, 0.0, 0.45 * v.opacity), v.radius, v.shadow)
         }
-        c.texture(v.tex, v.rect(), v.part(), v.transform, vec4(1.0, 1.0, 1.0, v.opacity), v.radius)
+        c.texture_color(v.tex, v.rect(), v.part(), v.transform, vec4(1.0, 1.0, 1.0, v.opacity), v.radius, v.color_space)
         c.opaque(v.cover())
         e.acquire(v.tex)
     }

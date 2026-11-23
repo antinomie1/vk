@@ -164,6 +164,7 @@ out.destroy(mut dev)
 - 遮挡剔除：每个矩形从完全盖住它的最上层形状开始画。满 alpha 的矩形和不透明
   纹理会遮住下面的内容，`opaque(r)` 可以再标记。全屏不透明窗口只画一个四边形。
 - 预乘 alpha 混合；颜色用非预乘 alpha，sRGB 目标用 `srgb()`。
+- 支持可选的逐四边形 HDR 色彩空间转换（`texture_color`、`set_output_color`），覆盖 SDR sRGB、线性 scRGB、BT.2020 PQ 与 BT.2020 HLG（含 HDR→SDR 色调映射及 10-bit PQ / FP16 scRGB 编码），标准 SDR 帧走零开销直通路径。
 
 尚未实现：背景模糊。
 
@@ -176,7 +177,9 @@ out.destroy(mut dev)
 `render(dev, canvas, e, frame)`。
 
 - `View` 是一张纹理（shm 上传或导入的 dmabuf；纯色用 1x1 纹理），带位置和
-  尺寸、源裁剪（wp_viewport）、缓冲变换、不透明度、圆角、投影和不透明区域。
+  尺寸、源裁剪（wp_viewport）、缓冲变换、不透明度、圆角、投影、不透明区域与
+  可选源色彩空间（`color_space`）；`Scene.set_output_color` 配置输出端 SDR/HDR
+  色彩空间与亮度参数（`scanout()` 会校对色彩空间一致）。
 - 损坏区域最多 8 个整像素矩形：自上一帧以来移动、变化或出现的部分，再按目标
   图像的年龄并上最近 4 帧的历史；年龄为 0 时全部重绘。客户端损坏区域会经过
   视图的裁剪、变换和缩放映射到屏幕。只换纹理不产生损坏，只重绘 `commit` 报告

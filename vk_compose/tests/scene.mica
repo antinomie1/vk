@@ -313,3 +313,21 @@ test "overlay candidates respect z-order and exclude overlay from primary" {
     assert(drew2)
     assert_eq(px(img2, 2, 2), (u8(0), u8(255), u8(0), u8(255)))
 }
+
+test "scanout requires matching output and view color space" {
+    guard let Some((d, _, _)) = setup() else {
+        return
+    }
+    var dev = d
+    guard let Ok((_, buf)) = dev.export_dmabuf(gpu.TextureDesc { width: 32, height: 32 }) else {
+        return
+    }
+    let tex = dev.import_dmabuf(gpu.Dmabuf { opaque: true, ..buf }).unwrap()
+    var s = compose.Scene.new(32, 32, vec4(0.0, 0.0, 0.0, 1.0))
+    let id = s.add(compose.View { tex, color_space: draw2d.color_bt2020_pq })
+    // PQ view on SDR output must compose (tone-map), not direct scanout.
+    assert_eq(s.scanout(), None)
+    // Switching output to HDR PQ allows direct scanout of PQ view.
+    s.set_output_color(draw2d.dst_hdr_pq, 203.0, 1000.0)
+    assert_eq(s.scanout(), Some(id))
+}

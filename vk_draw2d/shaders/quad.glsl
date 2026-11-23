@@ -13,8 +13,16 @@ struct Quad {
     float border; // ring width; 0 fills
     float soft;   // edge falloff in pixels (shadows); 0 is antialiased
     uint tex;     // bindless index; 0xFFFFFFFF for none
-    vec2 pad;     // 96-byte stride
+    uint color_space; // 0: sRGB, 1: scRGB linear, 2: BT.2020 PQ, 3: BT.2020 HLG
+    float pad;        // 96-byte stride
 };
 
 layout(buffer_reference, std430) readonly buffer Quads { Quad q[]; };
-layout(push_constant) uniform P { Quads quads; vec2 size; } p;
+layout(push_constant) uniform P {
+    Quads quads;
+    vec2 size;
+    uint dst_color; // 0: sRGB, 1: BT.2020 PQ, 2: scRGB linear
+    float sdr_nits;
+    float max_nits;
+    uint pad;
+} p;

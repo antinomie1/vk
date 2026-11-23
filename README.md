@@ -188,6 +188,7 @@ sampler conversion.
   it. Rectangles at full alpha and opaque textures hide what is under them;
   `opaque(r)` marks more. A full-screen opaque window draws one quad.
 - Premultiplied blending; colors straight alpha, `srgb()` for sRGB targets.
+- Optional per-quad HDR color-space conversion (`texture_color`, `set_output_color`) across SDR sRGB, linear scRGB, BT.2020 PQ, and BT.2020 HLG (including tone mapping onto SDR targets and 10-bit PQ / FP16 scRGB encoding onto HDR targets), with zero-cost passthrough for standard SDR frames.
 
 Not yet: backdrop blur.
 
@@ -201,7 +202,10 @@ Not yet: backdrop blur.
 
 - A `View` is a texture (an shm upload or an imported dmabuf; a solid color
   is 1x1) with a place and size, a source crop (wp_viewport), a buffer
-  transform, opacity, corner radius, drop shadow and opaque region.
+  transform, opacity, corner radius, drop shadow, opaque region, and optional
+  source color space (`color_space`); `Scene.set_output_color` configures the
+  output SDR/HDR color space and luminance targets (`scanout()` verifies color
+  space match).
 - Damage is up to 8 whole-pixel rectangles: what moved, changed or appeared
   since the last frame, widened by the target image's age from a 4-frame
   history; age 0 redraws everything. Client damage is mapped through the

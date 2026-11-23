@@ -19,6 +19,17 @@ pub type Rect = rect.Rect
 pub type Transform = transform.Transform
 pub type UvMap = transform.UvMap
 
+/// Source color spaces for `Quad.color_space` / `Canvas.texture_color`.
+pub let color_sdr: u32 = 0
+pub let color_scrgb: u32 = 1
+pub let color_bt2020_pq: u32 = 2
+pub let color_bt2020_hlg: u32 = 3
+
+/// Target output color spaces for `Canvas.set_output_color`.
+pub let dst_sdr: u32 = 0
+pub let dst_hdr_pq: u32 = 1
+pub let dst_hdr_scrgb: u32 = 2
+
 /// One instance, laid out as `Quad` in shaders/quad.glsl (std430).
 struct Quad derive(Bytes) {
     rect: vec4
@@ -31,7 +42,7 @@ struct Quad derive(Bytes) {
     border: f32
     soft: f32
     tex: u32
-    pad0: f32 = 0.0
+    color_space: u32 = 0
     pad1: f32 = 0.0
 }
 
@@ -40,6 +51,10 @@ let quad_size: u64 = 96
 struct Push derive(Bytes) {
     addr: u64
     size: vec2
+    dst_color: u32 = 0
+    sdr_nits: f32 = 203.0
+    max_nits: f32 = 1000.0
+    pad: u32 = 0
 }
 
 /// The instances `[at, at + n)` of the staged list, drawn scissored to `area`.
@@ -53,6 +68,9 @@ let no_texture: u32 = 0xFFFFFFFF
 
 pub struct Canvas {
     pipe: gpu.Pipeline
+    dst_color: u32 = 0
+    sdr_nits: f32 = 203.0
+    max_nits: f32 = 1000.0
     quads: List[Quad] = []
     /// Where each shape is opaque, in whole pixels; empty for none.
     covers: List[Rect] = []
@@ -68,6 +86,14 @@ pub fn Canvas.create(mut dev: gpu.Device, format: gpu.Format) -> Result[Canvas, 
     let d = gpu.Graphics { color: format, blend: gpu.Blend.Alpha }
     let pipe = try dev.graphics(d, embed("../shaders/quad.vert.spv"), embed("../shaders/quad.frag.spv"))
     return Ok(Canvas { pipe })
+}
+
+/// Configure target output color space (`dst_sdr`, `dst_hdr_pq`, `dst_hdr_scrgb`),
+/// SDR reference white luminance (`sdr_nits`), and peak display luminance (`max_nits`).
+pub fn Canvas.set_output_color(mut self, dst_color: u32, sdr_nits: f32, max_nits: f32) {
+    self.dst_color = dst_color
+    self.sdr_nits = max(sdr_nits, 10.0)
+    self.max_nits = max(max_nits, self.sdr_nits)
 }
 
 pub fn Canvas.destroy(self, mut dev: gpu.Device) {
@@ -99,31 +125,31 @@ fn inside(r: Rect, radius: f32) -> Rect {
     return if radius > 0.0 { r.grow(-0.293 * radius) } else { r }
 }
 
-fn Canvas.add(mut self, r: Rect, color: vec4, radius: f32, border: f32, soft: f32, tex: u32, m: UvMap, opaque: bool) {
+fn Canvas.add(mut self, r: Rect, color: vec4, radius: f32, border: f32, soft: f32, tex: u32, m: UvMap, opaque: bool, color_space: u32) {
     let c = self.clip()
     let clip = vec4(c.x, c.y, c.x + c.w, c.y + c.h)
-    self.quads.push(Quad { rect: vec4(r.x, r.y, r.w, r.h), color, clip, uv: m.origin, du: m.du, dv: m.dv, radius, border, soft, tex })
+    self.quads.push(Quad { rect: vec4(r.x, r.y, r.w, r.h), color, clip, uv: m.origin, du: m.du, dv: m.dv, radius, border, soft, tex, color_space })
     let cover = if opaque and color.w >= 1.0 { inside(r, radius).intersect(c).inner() } else { Rect {} }
     self.covers.push(cover)
 }
 
 pub fn Canvas.rect(mut self, r: Rect, color: vec4) {
-    self.add(r, color, 0.0, 0.0, 0.0, no_texture, whole(), true)
+    self.add(r, color, 0.0, 0.0, 0.0, no_texture, whole(), true, color_sdr)
 }
 
 pub fn Canvas.round_rect(mut self, r: Rect, color: vec4, radius: f32) {
-    self.add(r, color, radius, 0.0, 0.0, no_texture, whole(), true)
+    self.add(r, color, radius, 0.0, 0.0, no_texture, whole(), true, color_sdr)
 }
 
 /// A `width`-pixel ring inside `r`.
 pub fn Canvas.border(mut self, r: Rect, color: vec4, radius: f32, width: f32) {
-    self.add(r, color, radius, width, 0.0, no_texture, whole(), false)
+    self.add(r, color, radius, width, 0.0, no_texture, whole(), false, color_sdr)
 }
 
 /// A shadow of shape `r` blurred over `blur` pixels (it spreads that far
 /// outside `r`); draw it before the shape.
 pub fn Canvas.shadow(mut self, r: Rect, color: vec4, radius: f32, blur: f32) {
-    self.add(r.grow(blur), color, radius, 0.0, max(blur, 0.0), no_texture, whole(), false)
+    self.add(r.grow(blur), color, radius, 0.0, max(blur, 0.0), no_texture, whole(), false, color_sdr)
 }
 
 /// Texture `t` stretched over `r`, with rounded corners.
@@ -141,7 +167,13 @@ pub fn Canvas.image_part(mut self, t: gpu.Texture, r: Rect, uv: Rect, tint: vec4
 /// `turn`, over `r`, multiplied by `tint`, with rounded corners. An
 /// opaque texture (`Texture.opaque`) at full alpha hides what is under it.
 pub fn Canvas.texture(mut self, t: gpu.Texture, r: Rect, src: Rect, turn: Transform, tint: vec4, radius: f32) {
-    self.add(r, tint, radius, 0.0, 0.0, t.index(), transform.uv_map(src, turn), t.opaque())
+    self.add(r, tint, radius, 0.0, 0.0, t.index(), transform.uv_map(src, turn), t.opaque(), color_sdr)
+}
+
+/// Like `texture`, tagging the source texture's color space (`color_sdr`,
+/// `color_scrgb`, `color_bt2020_pq`, `color_bt2020_hlg`) for HDR/SDR conversion.
+pub fn Canvas.texture_color(mut self, t: gpu.Texture, r: Rect, src: Rect, turn: Transform, tint: vec4, radius: f32, color_space: u32) {
+    self.add(r, tint, radius, 0.0, 0.0, t.index(), transform.uv_map(src, turn), t.opaque(), color_space)
 }
 
 /// The last shape is opaque over `r` (pixels) when at full alpha: shapes
@@ -222,6 +254,9 @@ pub fn Canvas.draw(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, p: gpu.Pas
     }
     let pipe = self.pipe
     let size = vec2(f32(w), f32(h))
+    let dst_color = self.dst_color
+    let sdr_nits = self.sdr_nits
+    let max_nits = self.max_nits
     let spans = mem.replace(mut self.spans, [])
     e.render(p, fn(mut r) {
         r.bind(pipe)
@@ -231,7 +266,7 @@ pub fn Canvas.draw(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, p: gpu.Pas
             }
             let a = s.area
             r.scissor(i32(a.x), i32(a.y), u32(a.w), u32(a.h))
-            r.push(bytes_of(Push { addr: addr + u64(s.at) * quad_size, size }))
+            r.push(bytes_of(Push { addr: addr + u64(s.at) * quad_size, size, dst_color, sdr_nits, max_nits }))
             r.draw(6, u32(s.n))
         }
     })

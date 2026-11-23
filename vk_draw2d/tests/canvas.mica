@@ -228,3 +228,36 @@ test "several damage rectangles in one pass" {
     assert_eq(px(img, 12, 12), blue)
     assert_eq(px(img, 13, 13), red)
 }
+
+test "hdr color conversion: sdr-to-pq 10-bit and pq-to-sdr tonemap" {
+    guard let Some((d, c, tex)) = fx() else {
+        return
+    }
+    var dev = d
+    var canvas = c
+    // 1. PQ BT.2020 bright white (~1000 nits -> PQ ~0.75) tone-mapped onto SDR target stays bright & valid.
+    let pq_tex = texture(mut dev, 2, 2, [192, 192, 192, 255, 192, 192, 192, 255, 192, 192, 192, 255, 192, 192, 192, 255], true)
+    canvas.set_output_color(draw2d.dst_sdr, 203.0, 1000.0)
+    canvas.texture_color(pq_tex, full(), draw2d.Rect { w: 1.0, h: 1.0 }, draw2d.Transform.Normal, vec4(1.0), 0.0, draw2d.color_bt2020_pq)
+    let img = frame(mut dev, mut canvas, tex, None)
+    let (r, g, b, _) = px(img, 8, 8)
+    assert(r > 200 and g > 200 and b > 200)
+
+    // 2. SDR white (1.0 sRGB) encoded onto a 10-bit A2B10G10R10 PQ target produces ~0.58 PQ (203 nits).
+    let pq_target = dev.texture(gpu.TextureDesc { width: 16, height: 16, format: gpu.Format.A2B10G10R10_UNORM_PACK32, target: true }).unwrap()
+    var c10 = draw2d.Canvas.create(mut dev, gpu.Format.A2B10G10R10_UNORM_PACK32).unwrap()
+    c10.set_output_color(draw2d.dst_hdr_pq, 203.0, 1000.0)
+    c10.rect(full(), vec4(1.0, 1.0, 1.0, 1.0))
+    let img10 = frame(mut dev, mut c10, pq_target, None)
+    let off = (8 * 16 + 8) * 4
+    let word = u32(img10[off]) | (u32(img10[off + 1]) << 8) | (u32(img10[off + 2]) << 16) | (u32(img10[off + 3]) << 24)
+    let r10 = word & 0x3ff
+    let g10 = (word >> 10) & 0x3ff
+    let b10 = (word >> 20) & 0x3ff
+    // 203 nits in ST.2084 PQ is ~0.5807 * 1023 ≈ 594.
+    assert(r10 >= 570 and r10 <= 620)
+    assert(g10 >= 570 and g10 <= 620)
+    assert(b10 >= 570 and b10 <= 620)
+    c10.destroy(mut dev)
+    dev.destroy_texture(pq_target)
+}
