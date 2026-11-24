@@ -537,6 +537,12 @@ fn Device.set_state(mut self, t: res.Texture, u: sync.Use) {
     })
 }
 
+fn Device.set_foreign(mut self, t: res.Texture, on: bool) {
+    discard self.textures.update(t.h, fn(mut i) {
+        i.foreign_owned = on
+    })
+}
+
 // ---- resources ----
 
 pub fn Device.texture(mut self, d: res.TextureDesc) -> Result[res.Texture, str] {
@@ -747,6 +753,16 @@ pub fn Device.dmabuf_modifiers(self, format: vk.Format, target: bool) -> List[u6
 /// linux-dmabuf's main device.
 pub fn Device.drm_node(self) -> Option[(i64, i64)] {
     return self.drm_node
+}
+
+/// True when the driver can export Vulkan images as DRM dmabufs.
+pub fn Device.can_export_dmabuf(self) -> bool {
+    return self.ext.mem_fd.is_some() and self.ext.drm.is_some() and self.ext.dmabuf
+}
+
+/// True when the driver can export sync_file fences from queue submits.
+pub fn Device.can_export_sync_file(self) -> bool {
+    return self.ext.sem_fd.is_some()
 }
 
 /// The next submit waits for sync_file `fd` (taken; -1 means signaled).

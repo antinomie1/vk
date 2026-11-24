@@ -126,6 +126,10 @@ struct TexInfo {
     /// A swapchain image: not in the bindless arrays, never published.
     sc: bool = false
     ext: bool = false
+    /// Exported dmabuf render target: released to foreign queue family after GPU use.
+    exported: bool = false
+    /// Whether an exported dmabuf is currently owned by the foreign queue family.
+    foreign_owned: bool = false
     /// Usages it was made with.
     sampled: bool = true
     target: bool = false

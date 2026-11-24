@@ -485,6 +485,7 @@ fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.Text
         width: d.width,
         height: d.height,
         aspect: res.aspect(d.format),
+        exported: true,
         target: true,
     }
     return Ok((ti, buf))

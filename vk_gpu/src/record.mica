@@ -223,6 +223,8 @@ struct Rec {
     publish: List[res.Texture]
     /// Declared `storage` for the coming compute scope.
     held: List[res.Texture]
+    /// Exported dmabuf targets touched in this submit (released to foreign at end).
+    exported_used: List[res.Texture]
     /// Buffer writes not yet made visible.
     src_stage: vk.PipelineStageFlags2 = vk.PipelineStageFlags2.NONE
     src_access: vk.AccessFlags2 = vk.AccessFlags2.NONE
@@ -231,8 +233,20 @@ struct Rec {
 /// Move `t` into `u`, queueing a barrier when needed.
 fn Rec.use(mut self, mut dev: device.Device, t: res.Texture, u: sync.Use) {
     let i = dev.textures.get(t.h).unwrap()
-    if sync.needs(i.state, u) {
-        self.bars.push(sync.barrier(i.image, i.aspect, i.state, u))
+    if i.exported {
+        if i.foreign_owned {
+            self.bars.push(own_rw(i, self.foreign, self.family, true))
+            dev.set_foreign(t, false)
+            dev.set_state(t, sync.Use.General)
+            self.flush(mut dev)
+        }
+        if not self.exported_used.any(fn(p) => p.h == t.h) {
+            self.exported_used.push(t)
+        }
+    }
+    let cur = dev.textures.get(t.h).unwrap()
+    if sync.needs(cur.state, u) {
+        self.bars.push(sync.barrier(cur.image, cur.aspect, cur.state, u))
     }
     dev.set_state(t, u)
     self.publish.retain(fn(p) => p.h != t.h)
@@ -393,12 +407,12 @@ fn translate(mut dev: device.Device, e: encoder.Encoder, cb: vk.CommandBuffer) -
         cx.cmd.bind_sets(cb, vk.PipelineBindPoint.GRAPHICS, cx.layout, 0, 1, Ptr.of(set), 0, Ptr.null())
         cx.cmd.bind_sets(cb, vk.PipelineBindPoint.COMPUTE, cx.layout, 0, 1, Ptr.of(set), 0, Ptr.null())
     }
-    var r = Rec { cb, t: cx.cmd, layout: cx.layout, family: cx.family, foreign: cx.foreign, bars: mem.replace(mut dev.bars, []), publish: [], held: [] }
+    var r = Rec { cb, t: cx.cmd, layout: cx.layout, family: cx.family, foreign: cx.foreign, bars: mem.replace(mut dev.bars, []), publish: [], held: [], exported_used: [] }
     // Textures made since the last submit become sampleable (undefined
     // contents; transparent black is what a read most likely sees).
     var fresh = mem.replace(mut dev.fresh, [])
     for t in fresh {
-        if dev.textures.get(t.h).map(fn(i) => not i.dead and i.state == sync.Use.Undefined and not i.ext).unwrap_or(false) {
+        if dev.textures.get(t.h).map(fn(i) => not i.dead and i.state == sync.Use.Undefined and not i.ext and not i.exported).unwrap_or(false) {
             r.use(mut dev, t, sync.Use.Sampled)
         }
     }
@@ -540,6 +554,18 @@ fn translate(mut dev: device.Device, e: encoder.Encoder, cb: vk.CommandBuffer) -
             }
             Present(t) => r.use(mut dev, t, sync.Use.Present)
         }
+    }
+    for k in 0..r.exported_used.len() {
+        let t = r.exported_used[k]
+        r.publish.retain(fn(p) => p.h != t.h)
+    }
+    r.flush(mut dev)
+    for k in 0..r.exported_used.len() {
+        let t = r.exported_used[k]
+        let cur = dev.textures.get(t.h).unwrap()
+        r.bars.push(own_rw(cur, r.family, r.foreign, false))
+        dev.set_state(t, sync.Use.General)
+        dev.set_foreign(t, true)
     }
     r.flush(mut dev)
     dev.bars = mem.replace(mut r.bars, [])
