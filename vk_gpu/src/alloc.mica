@@ -11,7 +11,8 @@ import ctx
 /// Where a buffer lives: `Gpu` is device-local; `Upload` is written by the
 /// CPU (device-local too when the whole VRAM is mappable); `Readback` is
 /// read by the CPU (cached when possible).
-pub enum Mem derive(Show) {
+@derive(Show)
+pub enum Mem {
     Gpu
     Upload
     Readback

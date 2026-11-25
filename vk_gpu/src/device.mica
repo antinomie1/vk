@@ -17,7 +17,8 @@ import boot
 import record
 import external
 
-pub enum Priority derive(Show) {
+@derive(Show)
+pub enum Priority {
     Default
     Low
     Medium
@@ -386,7 +387,8 @@ pub fn Device.encoder(mut self) -> Result[encoder.Encoder, str] {
     }
     self.collect()
     self.open += 1
-    return Ok(encoder.new(self.id, self.spare.pop().unwrap_or(encoder.Lists {})))
+    let lists = self.spare.pop().unwrap_or(encoder.Lists {})
+    return Ok(encoder.new(self.id, lists))
 }
 
 /// Drop `e` unsubmitted.
@@ -734,7 +736,7 @@ pub fn Device.export_dmabuf(mut self, d: res.TextureDesc) -> Result[(res.Texture
 /// A render target other processes can read, laid out with one of
 /// `modifiers` (the driver picks; a KMS plane's or a parent compositor's
 /// list), and its dmabuf (the caller owns the fd).
-pub fn Device.export_dmabuf_with(mut self, d: res.TextureDesc, modifiers: &[u64]) -> Result[(res.Texture, external.Dmabuf), str] {
+pub fn Device.export_dmabuf_with(mut self, d: res.TextureDesc, modifiers: Slice[u64]) -> Result[(res.Texture, external.Dmabuf), str] {
     guard d.width > 0 and d.height > 0 and not modifiers.is_empty() else {
         return Err("dmabuf {d.width}x{d.height} with {modifiers.len()} modifiers")
     }
@@ -813,7 +815,7 @@ fn Device.alloc_stage(mut self, byte_len: u64) -> Result[(res.Staged, u64), str]
 
 /// Copy `data` into the upload ring; shaders read it at `addr()`. The
 /// bytes stay valid until the GPU finishes the next submit.
-pub fn Device.stage(mut self, data: &[u8]) -> Result[res.Staged, str] {
+pub fn Device.stage(mut self, data: Slice[u8]) -> Result[res.Staged, str] {
     let (s, mapped) = try self.alloc_stage(u64(data.len()))
     if data.len() > 0 {
         unsafe Ptr.copy(Ptr[u8].from_addr(usize(mapped)), data.as_ptr(), data.len())
@@ -839,7 +841,7 @@ fn Device.new_chunk(mut self, n: u64) -> Result[int, str] {
 /// Write `data` at `offset` in `b`: directly when `b` is host-visible
 /// (the GPU must not be reading that range), else through the upload ring
 /// and a copy recorded in `e`.
-pub fn Device.write(mut self, mut e: encoder.Encoder, b: res.Buffer, offset: u64, data: &[u8]) -> Result[(), str] {
+pub fn Device.write(mut self, mut e: encoder.Encoder, b: res.Buffer, offset: u64, data: Slice[u8]) -> Result[(), str] {
     let i = try self.buf(b)
     guard e.dev == self.id else {
         return Err("encoder belongs to another device")
@@ -858,7 +860,7 @@ pub fn Device.write(mut self, mut e: encoder.Encoder, b: res.Buffer, offset: u64
 
 /// Fill all of `t` from tightly packed texels; shaders may sample it once
 /// `e` is submitted.
-pub fn Device.write_texture(mut self, mut e: encoder.Encoder, t: res.Texture, data: &[u8]) -> Result[(), str] {
+pub fn Device.write_texture(mut self, mut e: encoder.Encoder, t: res.Texture, data: Slice[u8]) -> Result[(), str] {
     let i = try self.tex(t)
     guard e.dev == self.id and not i.sc and not i.ext else {
         return Err("cannot write this texture with this encoder")
@@ -876,7 +878,7 @@ pub fn Device.write_texture(mut self, mut e: encoder.Encoder, t: res.Texture, da
 /// bytes from texel 0, 0, as in a wl_shm pool) into the same rectangle of
 /// `t`. Only the bytes the rectangle spans are staged, so a client's damage
 /// costs its own size, not the whole buffer's.
-pub fn Device.write_texture_rect(mut self, mut e: encoder.Encoder, t: res.Texture, x: u32, y: u32, w: u32, h: u32, data: &[u8], stride: u32) -> Result[(), str] {
+pub fn Device.write_texture_rect(mut self, mut e: encoder.Encoder, t: res.Texture, x: u32, y: u32, w: u32, h: u32, data: Slice[u8], stride: u32) -> Result[(), str] {
     let i = try self.tex(t)
     guard e.dev == self.id and not i.sc and not i.ext else {
         return Err("cannot write this texture with this encoder")

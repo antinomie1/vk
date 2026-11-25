@@ -3,13 +3,15 @@
 import glfw_sys as sys
 import key
 
-pub enum Action: i32 derive(Show) {
+@derive(Show)
+pub enum Action: i32 {
     Release = 0
     Press = 1
     Repeat = 2
 }
 
-pub enum Mods: u32 derive(Flags, Show) {
+@derive(Flags, Show)
+pub enum Mods: u32 {
     SHIFT = 1
     CONTROL = 2
     ALT = 4
@@ -18,7 +20,8 @@ pub enum Mods: u32 derive(Flags, Show) {
     NUM_LOCK = 32
 }
 
-pub enum MouseButton: i32 derive(Show) {
+@derive(Show)
+pub enum MouseButton: i32 {
     Left = 0
     Right = 1
     Middle = 2

@@ -137,7 +137,7 @@ fn type_item(r: registry.Registry, mut cx: Cx, td: registry.TypeDef, mut enums: 
         "basetype" => out += "pub type {name} = {types.basetype(td)}\n\n"
         "handle" => {
             let raw = if td.flag { "usize" } else { "u64" }
-            out += "pub struct {name} derive(Show, Hash) \{\n    pub raw: {raw} = 0\n\}\n\n"
+            out += "@derive(Show, Hash)\npub struct {name} \{\n    pub raw: {raw} = 0\n\}\n\n"
         }
         "enum" => {
             if let Some(f) = cx.owner.get(td.name) {
@@ -162,7 +162,7 @@ fn type_item(r: registry.Registry, mut cx: Cx, td: registry.TypeDef, mut enums: 
     }
 }
 
-/// `pub enum Name: i32 { ... }`, or for a bitmask `Name: u32 derive(Flags)`
+/// `pub enum Name: i32 { ... }`, or for a bitmask `@derive(Flags) enum Name: u32`
 /// with the values of its `FlagBits` enum `bits`.
 fn enum_item(r: registry.Registry, mut cx: Cx, c_name: str, bits: str, bitmask: bool, wide: bool) -> str {
     let name = names.type_name(c_name)
@@ -183,11 +183,12 @@ fn enum_item(r: registry.Registry, mut cx: Cx, c_name: str, bits: str, bitmask: 
             body += "    {vn} = {v.value}\n"
         }
     }
-    let repr = if not bitmask { "i32 derive(Show, Hash)" } else if big { "u64 derive(Flags, Show, Hash)" } else { "u32 derive(Flags, Show, Hash)" }
+    let drv = if not bitmask { "@derive(Show, Hash)\n" } else { "@derive(Flags, Show, Hash)\n" }
+    let repr = if not bitmask { "i32" } else if big { "u64" } else { "u32" }
     guard not body.is_empty() else {
-        return "pub enum {name}: {repr} \{\}\n\n"
+        return "{drv}pub enum {name}: {repr} \{\}\n\n"
     }
-    return "pub enum {name}: {repr} \{\n{body}\}\n\n"
+    return "{drv}pub enum {name}: {repr} \{\n{body}\}\n\n"
 }
 
 fn struct_item(r: registry.Registry, mut cx: Cx, td: registry.TypeDef) -> str {

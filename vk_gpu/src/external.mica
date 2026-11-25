@@ -394,7 +394,7 @@ fn import_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: Dmabuf, 
 
 /// An exportable render target laid out with one of `modifiers`, and its
 /// dmabuf (the fds are the caller's).
-fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.TextureDesc, modifiers: &[u64]) -> Result[(res.TexInfo, Dmabuf), str] {
+fn export_image(cx: ctx.Ctx, e: boot.External, mem: alloc.Allocator, d: res.TextureDesc, modifiers: Slice[u64]) -> Result[(res.TexInfo, Dmabuf), str] {
     let (fdfns, drm) = try require(e)
     unsafe let list = vk.ImageDrmFormatModifierListCreateInfoEXT { drm_format_modifier_count: u32(modifiers.len()), p_drm_format_modifiers: modifiers.as_ptr() }
     unsafe let external = vk.ExternalMemoryImageCreateInfo { p_next: Ptr.of(list).cast[u8](), handle_types: dma_buf() }

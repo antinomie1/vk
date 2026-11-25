@@ -60,7 +60,7 @@ fn has_ext(props: List[vk.ExtensionProperties], name: str) -> bool {
     return props.any(fn(p) => named(p.extension_name, name))
 }
 
-unsafe fn cstrs(names: &[str]) -> List[Ptr[u8]] {
+unsafe fn cstrs(names: Slice[str]) -> List[Ptr[u8]] {
     var out: List[Ptr[u8]] = []
     for s in names {
         out.push(s.as_cstr())

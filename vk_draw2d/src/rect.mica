@@ -1,6 +1,7 @@
 // Axis-aligned rectangles in pixels: shapes, clips and damage.
 
-pub struct Rect derive(Show) {
+@derive(Show)
+pub struct Rect {
     pub x: f32 = 0.0
     pub y: f32 = 0.0
     pub w: f32 = 0.0

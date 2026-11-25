@@ -1,7 +1,8 @@
 // Keyboard keys, with GLFW's values (glfw_sys `key_*`); `Unknown` for keys
 // GLFW has no name for.
 
-pub enum Key: i32 derive(Show) {
+@derive(Show)
+pub enum Key: i32 {
     Unknown = -1
     Space = 32
     Apostrophe = 39

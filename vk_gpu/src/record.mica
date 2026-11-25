@@ -239,6 +239,15 @@ fn Rec.use(mut self, mut dev: device.Device, t: res.Texture, u: sync.Use) {
             dev.set_foreign(t, false)
             dev.set_state(t, sync.Use.General)
             self.flush(mut dev)
+        } else if i.state == sync.Use.Undefined and (u == sync.Use.CopySrc or u == sync.Use.Sampled) {
+            // An untouched exported dmabuf may have been written through its
+            // exported fd (in GENERAL layout); acquire from FOREIGN instead of
+            // discarding its contents with an UNDEFINED transition.
+            var ext_i = i
+            ext_i.state = sync.Use.General
+            self.bars.push(own_rw(ext_i, self.foreign, self.family, true))
+            dev.set_state(t, sync.Use.General)
+            self.flush(mut dev)
         }
         if not self.exported_used.any(fn(p) => p.h == t.h) {
             self.exported_used.push(t)

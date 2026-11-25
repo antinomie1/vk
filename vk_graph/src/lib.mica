@@ -54,7 +54,7 @@ pub fn Graph.texture(mut self, mut dev: gpu.Device, d: gpu.TextureDesc) -> Resul
     return Ok(tex)
 }
 
-fn ids(ts: &[gpu.Texture]) -> List[u32] {
+fn ids(ts: Slice[gpu.Texture]) -> List[u32] {
     var out: List[u32] = []
     for t in ts {
         out.push(t.index())
@@ -63,7 +63,7 @@ fn ids(ts: &[gpu.Texture]) -> List[u32] {
 }
 
 /// A pass drawing into `p.target` (and `p.depth`) that samples `reads`.
-pub fn Graph.render(mut self, p: gpu.Pass, reads: &[gpu.Texture], take body: Box[fn(mut gpu.Render)]) {
+pub fn Graph.render(mut self, p: gpu.Pass, reads: Slice[gpu.Texture], take body: Box[fn(mut gpu.Render)]) {
     var writes: List[u32] = [p.target.index()]
     if let Some(d) = p.depth {
         writes.push(d.index())
@@ -72,12 +72,12 @@ pub fn Graph.render(mut self, p: gpu.Pass, reads: &[gpu.Texture], take body: Box
 }
 
 /// A compute pass that samples `reads` and imageStores `writes`.
-pub fn Graph.compute(mut self, reads: &[gpu.Texture], writes: &[gpu.Texture], take body: Box[fn(mut gpu.Compute)]) {
+pub fn Graph.compute(mut self, reads: Slice[gpu.Texture], writes: Slice[gpu.Texture], take body: Box[fn(mut gpu.Compute)]) {
     self.nodes.push(Node { reads: ids(reads), writes: ids(writes), storage: writes.to_list(), body: Body.Work(body) })
 }
 
 /// Record every pass `outputs` depend on into `e`, then start a new frame.
-pub fn Graph.run(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, outputs: &[gpu.Texture]) {
+pub fn Graph.run(mut self, mut dev: gpu.Device, mut e: gpu.Encoder, outputs: Slice[gpu.Texture]) {
     var needed = ids(outputs)
     var live: List[bool] = []
     for _ in 0..self.nodes.len() {

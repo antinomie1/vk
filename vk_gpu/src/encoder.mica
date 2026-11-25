@@ -134,7 +134,7 @@ fn Encoder.push_cmd(mut self, take c: Cmd) {
     self.l.cmds.push(c)
 }
 
-fn push(mut l: Lists, data: &[u8]) {
+fn push(mut l: Lists, data: Slice[u8]) {
     let at = u32(l.bytes.len())
     for b in data {
         l.bytes.push(b)
@@ -163,7 +163,7 @@ pub fn Render.bind(mut self, p: res.Pipeline) {
 }
 
 /// Up to 128 bytes of push constants (`bytes_of(x)`), read by every stage.
-pub fn Render.push(mut self, data: &[u8]) {
+pub fn Render.push(mut self, data: Slice[u8]) {
     push(mut self.l, data)
 }
 
@@ -195,7 +195,7 @@ pub fn Compute.bind(mut self, p: res.Pipeline) {
     self.l.cmds.push(Cmd.Bind(p))
 }
 
-pub fn Compute.push(mut self, data: &[u8]) {
+pub fn Compute.push(mut self, data: Slice[u8]) {
     push(mut self.l, data)
 }
 

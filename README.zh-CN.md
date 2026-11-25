@@ -32,7 +32,7 @@
 - `r.result()` 把 `VkResult` 变成 `Result[(), VkResult]`，只有 `SUCCESS` 是
   `Ok`，所以任何调用都能用 `try`。
 - 枚举是 `enum Format: i32`，取值为 ash 风格：`Format.R8G8B8A8_UNORM`、
-  `ImageType.TYPE_2D`。位掩码是 `enum BufferUsageFlags: u32 derive(Flags)`，
+  `ImageType.TYPE_2D`。位掩码是 `@derive(Flags) enum BufferUsageFlags: u32`，
   支持 `|`、`contains`、`bits()`。`XFlagBits` 是 `XFlags` 的别名。
 - 结构体字段有默认值，`sType` 已预设：`vk.BufferCreateInfo { size: 64, usage: ... }`。
   含指针的结构体是 `unsafe struct`，因此是 `Send` 且可出现在安全签名中。

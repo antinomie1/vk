@@ -34,7 +34,7 @@ Vulkan for [Mica](https://github.com/antinomie1/mica), built with
   `SUCCESS` is `Ok`, so `try` works on any call.
 - Enums are `enum Format: i32`, with values in ash style:
   `Format.R8G8B8A8_UNORM`, `ImageType.TYPE_2D`. Bitmasks are
-  `enum BufferUsageFlags: u32 derive(Flags)`, so `|`, `contains` and
+  `@derive(Flags) enum BufferUsageFlags: u32`, so `|`, `contains` and
   `bits()` work. `XFlagBits` is an alias of `XFlags`.
 - Structs have field defaults, and `sType` is preset:
   `vk.BufferCreateInfo { size: 64, usage: ... }`. A struct that holds

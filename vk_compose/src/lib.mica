@@ -216,7 +216,7 @@ pub fn Scene.remove(mut self, id: u32) {
 }
 
 /// Remove a batch of ids in one O(N) compaction pass.
-pub fn Scene.remove_many(mut self, ids: &[u32]) {
+pub fn Scene.remove_many(mut self, ids: Slice[u32]) {
     guard not ids.is_empty() and not self.entries.is_empty() else {
         return
     }
@@ -289,7 +289,7 @@ pub fn Scene.place_above(mut self, id: u32, other: u32) {
 /// Reorder views to `order` (back to front) in O(N log N) time using the
 /// longest increasing subsequence to minimize damage, or O(N) with zero
 /// damage/allocations when the order did not change.
-pub fn Scene.reorder(mut self, order: &[u32]) {
+pub fn Scene.reorder(mut self, order: Slice[u32]) {
     let n = self.entries.len()
     guard n > 1 else {
         return
@@ -482,7 +482,7 @@ pub fn Scene.overlay_candidates(self, max_count: int) -> List[u32] {
 
 /// Mark `ids` as hardware-promoted overlays (excluded from primary GPU
 /// composition); damages the primary plane on entry/exit transitions.
-pub fn Scene.set_overlays(mut self, ids: &[u32]) {
+pub fn Scene.set_overlays(mut self, ids: Slice[u32]) {
     if ids.is_empty() and not self.has_overlays {
         return
     }
@@ -515,7 +515,7 @@ pub fn Scene.set_overlays(mut self, ids: &[u32]) {
 
 /// What the last `render` changed on screen against the frame before it:
 /// KMS FB_DAMAGE_CLIPS, or damage for a parent compositor.
-pub fn Scene.changed(self) -> &[Rect] {
+pub fn Scene.changed(self) -> Slice[Rect] {
     return self.history[0].rects()
 }
 

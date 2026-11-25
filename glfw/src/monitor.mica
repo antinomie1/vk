@@ -6,7 +6,8 @@ import glfw_sys as sys
 import cstr
 import window
 
-pub struct VideoMode derive(Show) {
+@derive(Show)
+pub struct VideoMode {
     pub width: i32
     pub height: i32
     pub red_bits: i32

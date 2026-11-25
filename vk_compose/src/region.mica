@@ -20,7 +20,7 @@ pub fn Region.is_empty(self) -> bool {
     return self.rects.is_empty()
 }
 
-pub fn Region.rects(self) -> &[Rect] {
+pub fn Region.rects(self) -> Slice[Rect] {
     return self.rects
 }
 

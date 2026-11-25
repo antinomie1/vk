@@ -17,7 +17,8 @@ fn device() -> Option[gpu.Device] {
     }
 }
 
-struct Fill derive(Bytes) {
+@derive(Bytes)
+struct Fill {
     addr: u64
     count: u32
     pad: u32

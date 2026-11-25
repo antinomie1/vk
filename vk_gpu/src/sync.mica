@@ -5,7 +5,8 @@
 
 import vk
 
-enum Use derive(Show) {
+@derive(Show)
+enum Use {
     Undefined
     Color
     Depth
